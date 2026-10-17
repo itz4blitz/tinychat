@@ -302,7 +302,9 @@ impl Shell {
             }
             let state = &self.sidebar_state;
             state.inbox_list.scroll_to(gpui::ListOffset::default());
-            state.home_list.scroll_to(gpui::ListOffset::default());
+            if !matches!(&state.mode, Mode::Space(space) if space.network == Network::Discord) {
+                state.home_list.scroll_to(gpui::ListOffset::default());
+            }
             state.tree_scroll.scroll_to_item(0, ScrollStrategy::Top);
             cx.notify();
             return;
@@ -320,13 +322,20 @@ impl Shell {
                 state.inbox.fill(epoch, fresh, total);
             }
         }
-        let home_network = mode.network().filter(|_| matches!(mode, Mode::Network(_)));
+        let keep_discord = state.mode.network() == Some(Network::Discord) && mode.network() == Some(Network::Discord);
+        let home_network = match &mode {
+            Mode::Space(space) if space.network == Network::Discord => Some(Network::Discord),
+            Mode::Network(network) => Some(*network),
+            _ => None,
+        };
         state.home.switch_network(home_network, &mut state.saved_homes);
         state.mode = mode;
         state.cursor = None;
         state.drill = None;
         state.slack_menu = false;
-        state.home_unread = false;
+        if !keep_discord {
+            state.home_unread = false;
+        }
         state.apps_open = false;
         state.apps_all = false;
         state.pill = 0;
@@ -680,6 +689,9 @@ impl Shell {
     /// Opens a row the user chose by hand: the unread walk starts over from there.
     fn pick_row(&mut self, row: &Conversation, cx: &mut Context<Self>) {
         self.sidebar_state.walked.clear();
+        if row.key.network == Network::Discord && row.kind.is_direct() && matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
+            self.go(Mode::Network(Network::Discord), cx);
+        }
         if row.kind == ConversationKind::Forum && row.key.network == Network::Telegram {
             self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
             return;
@@ -842,6 +854,10 @@ impl Shell {
     /// The people whose presence these rows draw, and the rows themselves for their previews.
     fn watch_rows<'a>(&self, rows: impl Iterator<Item = &'a Rc<Conversation>> + Clone, cx: &mut Context<Self>) {
         let hub = self.people_state.hub();
+        let home = &self.sidebar_state.home_items;
+        let visible = on_screen(&self.sidebar_state.home_list, home.len(), |ix| home[ix].height());
+        let extra = home[visible].iter().filter_map(home::Item::conversation).filter(|_| matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord));
+        let rows = rows.cloned().chain(extra.cloned());
         let peers = rows.clone().filter_map(|c| Some(Key { id: c.peer.clone()?, ..c.key.clone() }));
         hub.watch(WATCH, peers, cx);
         hub.watch_rows(WATCH, rows.map(|c| c.key.clone()), cx);
@@ -1048,7 +1064,7 @@ impl Shell {
         out
     }
 
-    fn title_strip(&self, cx: &mut Context<Self>) -> Div {
+    fn title_strip(&self, mode: &Mode, cx: &mut Context<Self>) -> Div {
         let strip = drags_window(div()).h(px(theme::STRIP)).flex_none().pl(px(theme::PANE_PAD)).pr(px(12.)).flex().items_center().gap(px(8.));
         let quiet = |button: Stateful<Div>| button.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         let back = |id: &'static str, words: String, cx: &mut Context<Self>| {
@@ -1073,7 +1089,7 @@ impl Shell {
                 .child(pane_title(title))
                 .children(place.map(|place| div().flex_none().max_w(px(120.)).truncate().type_small().text_color(theme::text_faint()).child(place)));
         }
-        match &self.sidebar_state.mode {
+        match mode {
             Mode::Inbox => {
                 let filter = self.sidebar_state.filter;
                 let counts = self.sidebar_state.counts;
@@ -1333,9 +1349,22 @@ impl Shell {
         }
     }
 
+    /// The persistent Discord parent column, using the same home list and scroll state.
+    pub(super) fn discord_overview(&self, snapshot: &Snapshot, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        self.sidebar_state.width.set(width);
+        div().w(px(width)).h_full().flex_none().bg(theme::sidebar()).border_r_1().border_color(theme::hairline()).child(
+            div().id("discord-overview").size_full().flex().flex_col()
+                .child(self.title_strip(&Mode::Network(Network::Discord), cx))
+                .child(self.jump_strip(cx))
+                .child(div().flex_1().min_h_0().child(self.home_list(snapshot, window, cx)))
+        )
+    }
+
     pub(super) fn sidebar(&self, snapshot: &Snapshot, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let people = self.sidebar_state.mode == Mode::People;
-        self.sidebar_state.width.set(width);
+        if !matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
+            self.sidebar_state.width.set(width);
+        }
         let body = if people {
             let drawn = self.slots.people.and_then(|draw| draw(self, window, cx));
             drawn.unwrap_or_else(|| empty_state("icons/users.svg", "People", "Friends and contacts show up here.").px(px(24.)).into_any_element())
@@ -1354,7 +1383,7 @@ impl Shell {
             .bg(theme::sidebar())
             .border_r_1()
             .border_color(theme::hairline())
-            .child(self.title_strip(cx))
+            .child(self.title_strip(&self.sidebar_state.mode, cx))
             .when(!people, |sidebar| sidebar.child(self.jump_strip(cx)))
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))

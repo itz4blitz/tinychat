@@ -93,5 +93,23 @@ For reconciliation with `polish/01-system.md`: `LEAD 20` (leading box of every 2
 - **Hover swaps** happen inside a trailing slot of fixed width so the name never re-truncates. Presence and the group's front face take `theme::over(fill, sidebar)` as their ring per state (#121315, #202123, #2E2F31).
 - The private-channel lock and the spine are child divs; no masks, no blur. Typing dots are the only timer, in their own entity.
 
+
+### Discord server columns
+
+At wide window sizes, selecting a Discord server keeps the Discord overview
+visible in a 280 pt column and opens its channels in the regular sidebar beside
+it. The overview retains DMs, folders, expansion state and scroll position;
+selecting another server replaces only the channels column and highlights that
+server immediately. Choosing a DM returns to the Discord home and hides the
+channels column. Message requests likewise return to the home before drilling
+into their list. Home data continues refreshing while a server is selected.
+
+The extra column appears only when the rail, both lists, the 392 pt minimum
+conversation and any visible right pane fit. Otherwise the original single
+sidebar and back navigation apply. The existing sidebar resize handle changes
+the channels width; the overview width is fixed. Other networks keep their
+existing layout.
+
+
 ## Deliberately absent
 A server-icon column; chevrons and inline trees on server rows; banners, boosts, member and online counts; role colours; "@" in mention badges; a grey muted-mention look; mute bells on rows; elapsed timers and rich-presence art; time on Discord DM rows at rest; a read-only mark; unread-first sorting; prefix grouping; Slack's Unreads, Activity, Later, Huddles and Canvases views (Open in Slack); total reply count in a Threads row (in the pane header); any animation of rows filling in.

@@ -52,8 +52,10 @@ fn whole(network: Network, folder: Option<String>, shelf: Shelf) -> std::io::Res
 impl Shell {
     /// Reads what the home on show draws. Asking is also what makes chatd bring it up to date.
     pub(in crate::gui) fn load_home(&mut self, cx: &mut Context<Self>) {
-        let Mode::Network(network) = self.sidebar_state.mode else {
-            return;
+        let network = match &self.sidebar_state.mode {
+            Mode::Network(network) => *network,
+            Mode::Space(space) if space.network == Network::Discord => Network::Discord,
+            _ => return,
         };
         // Keys only: the read runs off this thread.
         let drill = self.sidebar_state.drill.as_ref().map(|drill| match drill {
@@ -156,9 +158,12 @@ impl Shell {
         let state = &self.sidebar_state;
         let items: Vec<Item> = match (&state.mode, &state.drill) {
             (Mode::Network(_), Some(_)) => state.home.drilled.iter().cloned().map(Item::Chat).collect(),
-            (Mode::Network(Network::Discord), None) => {
+            (Mode::Network(Network::Discord), None) | (Mode::Space(Key { network: Network::Discord, .. }), None) => {
                 let spaces: Vec<protocol::Space> = self.spaces.iter().filter(|s| s.key.network == Network::Discord).cloned().collect();
-                let open_space = self.snapshot.as_ref().and_then(|s| s.open.as_ref()).and_then(|open| open.space.clone());
+                let open_space = match &state.mode {
+                    Mode::Space(space) => Some(space.id.clone()),
+                    _ => self.snapshot.as_ref().and_then(|s| s.open.as_ref()).and_then(|open| open.space.clone()),
+                };
                 let items = home::discord(&state.home, &spaces, open_space.as_deref(), state.home_unread);
                 // The servers' indexes are into the shell's whole list of Spaces.
                 items
@@ -182,7 +187,7 @@ impl Shell {
             }
             _ => Vec::new(),
         };
-        let news = if matches!(self.sidebar_state.mode, Mode::Network(Network::Discord)) && self.sidebar_state.drill.is_none() {
+        let news = if self.sidebar_state.mode.network() == Some(Network::Discord) && self.sidebar_state.drill.is_none() {
             let state = &self.sidebar_state;
             let spaces: Vec<protocol::Space> = self.spaces.iter().filter(|s| s.key.network == Network::Discord).cloned().collect();
             home::discord(&state.home, &spaces, None, true).iter().filter(|item| matches!(item, Item::Chat(_) | Item::Space { .. } | Item::Folder { .. })).count() as u32
@@ -212,7 +217,12 @@ impl Shell {
                     self.people_scope(Some(Network::Discord), cx);
                     return;
                 }
-                Act::Requests => return self.drill(Drill::Requests, cx),
+                Act::Requests => {
+                    if matches!(self.sidebar_state.mode, Mode::Space(_)) {
+                        self.go(Mode::Network(Network::Discord), cx);
+                    }
+                    return self.drill(Drill::Requests, cx);
+                },
                 Act::Archive => return self.drill(Drill::Archive, cx),
                 Act::MoreDms => home.dms_all = true,
                 Act::MoreVoice => home.voice_all = true,
@@ -249,7 +259,7 @@ impl Shell {
         let Some(item) = self.sidebar_state.home_items.get(ix).cloned() else {
             return div().into_any_element();
         };
-        let focused = self.sidebar_state.cursor == Some(ix) && (self.sidebar_state.focus.is_focused(window) || self.focus.is_focused(window));
+        let focused = self.sidebar_state.listed() && self.sidebar_state.cursor == Some(ix) && (self.sidebar_state.focus.is_focused(window) || self.focus.is_focused(window));
         let network = self.sidebar_state.home.network;
         let click = move |row: Stateful<Div>, cx: &mut Context<Self>| row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate_home(ix, cx)));
         match item {
@@ -306,7 +316,7 @@ impl Shell {
             return list_row(("space-gone", ix), theme::row_height(theme::ROW_ONE), false, false, div());
         };
         let lit = space.attention > 0 || space.unread;
-        let here = self.open.as_ref().is_some_and(|open| self.snapshot.as_ref().and_then(|s| s.open.as_ref()).is_some_and(|row| row.key == *open && row.space.as_deref() == Some(space.key.id.as_str())));
+        let here = if let Mode::Space(selected) = &self.sidebar_state.mode { selected == &space.key } else { self.open.as_ref().is_some_and(|open| self.snapshot.as_ref().and_then(|s| s.open.as_ref()).is_some_and(|row| row.key == *open && row.space.as_deref() == Some(space.key.id.as_str()))) };
         let icon = self.media_path(&space.key, space.icon.as_ref());
         let color = if space.muted { theme::text_faint() } else if lit { theme::text() } else { theme::text_soft() };
         // A team's chevron sits in the tree's 16 slot, so its name lines up with its channels'.

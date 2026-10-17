@@ -426,7 +426,7 @@ impl Shell {
         let mut directs = false;
         for key in dirty.rows {
             let in_tree = self.trees.values().any(|tree| tree.conversations.iter().any(|c| c.key == key));
-            directs |= !in_tree && matches!(self.sidebar_state.mode, Mode::Network(network) if network == key.network);
+            directs |= !in_tree && self.sidebar_state.home.network == Some(key.network);
             if in_tree || self.open.as_ref() == Some(&key) {
                 self.load_row(key, cx);
             }

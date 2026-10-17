@@ -164,6 +164,16 @@ pub fn plan(window: f32, sidebar: f32, hidden: bool, right: Option<f32>) -> Plan
     Plan { sidebar, right }
 }
 
+/// Add the Discord parent column only when both lists and the conversation fit.
+fn discord_overview_width(window: f32, sidebar: f32, hidden: bool, right: Option<f32>, server: bool) -> f32 {
+    const OVERVIEW: f32 = 280.;
+    if server && !hidden && window >= RAIL_WIDTH + sidebar + OVERVIEW + CONVERSATION_MIN + right.unwrap_or(0.) {
+        OVERVIEW
+    } else {
+        0.
+    }
+}
+
 /// The right pane would replace the conversation here rather than sit beside it: Details
 /// hides then, and a thread or search stands in for the conversation (07 §4).
 pub fn narrow(window: f32, sidebar: f32, hidden: bool, right: f32) -> bool {
@@ -337,9 +347,10 @@ impl Shell {
             return;
         }
         let x = f32::from(event.position.x);
+        let overview = discord_overview_width(f32::from(window.viewport_size().width), self.layout_state.sidebar_width, self.layout_state.sidebar_hidden, self.layout_state.right.as_ref().filter(|_| !self.pane_tucked()).map(|_| self.layout_state.right_width), matches!(&self.sidebar_state.mode, super::sidebar::Mode::Space(space) if space.network == Network::Discord));
         let state = &mut self.layout_state;
         match edge {
-            Edge::Sidebar => state.sidebar_width = (x - RAIL_WIDTH).round().clamp(SIDEBAR_RANGE.0, SIDEBAR_RANGE.1),
+            Edge::Sidebar => state.sidebar_width = (x - RAIL_WIDTH - overview).round().clamp(SIDEBAR_RANGE.0, SIDEBAR_RANGE.1),
             Edge::Right => {
                 let window = f32::from(window.viewport_size().width);
                 state.right_width = (window - x).round().clamp(RIGHT_RANGE.0, RIGHT_RANGE.1);
@@ -581,12 +592,14 @@ impl Shell {
     }
 
     /// The open menu, over everything, with a catcher behind it that closes it.
-    fn menu_layer(&self, snapshot: &Snapshot, sidebar: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+    fn menu_layer(&self, snapshot: &Snapshot, sidebar: f32, overview: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
         let open = self.layout_state.menu.as_ref()?;
         let tall = f32::from(window.viewport_size().height);
         // The rail's add button and own avatar, and the sidebar strip's trailing button.
         let rail_button = |from_bottom: f32| place::anchor(16., tall - from_bottom - 40., 40., 40.);
-        let strip_button = place::anchor(RAIL_WIDTH + sidebar - 12. - 28., 12., 28., 28.);
+        let strip_left = RAIL_WIDTH + if matches!(open, Menu::Space(_)) { overview } else { 0. };
+        let strip_width = if overview > 0. && matches!(open, Menu::Network(_)) { overview } else { sidebar };
+        let strip_button = place::anchor(strip_left + strip_width - 12. - 28., 12., 28., 28.);
         let placed: AnyElement = match open {
             Menu::Add => {
                 let content = fade_in("menu-add", 120, self.add_menu(snapshot, cx));
@@ -825,8 +838,9 @@ impl Render for Shell {
         // Too narrow for the pane beside the conversation: sticky Details hides (07 §4).
         self.note_room(narrow(width, state.sidebar_width, state.sidebar_hidden, state.right_width), None);
         let right_width = state.right.as_ref().filter(|_| !self.pane_tucked()).map(|_| state.right_width);
-        let plan = plan(width, state.sidebar_width, state.sidebar_hidden, right_width);
-        self.note_room(self.pane_narrow(), Some(conversation_width(width, &plan)));
+        let overview = discord_overview_width(width, state.sidebar_width, state.sidebar_hidden, right_width, matches!(&self.sidebar_state.mode, super::sidebar::Mode::Space(space) if space.network == Network::Discord));
+        let plan = plan(width - overview, state.sidebar_width, state.sidebar_hidden, right_width);
+        self.note_room(self.pane_narrow(), Some(conversation_width(width - overview, &plan)));
         let floating = plan.sidebar.is_none() && state.floating;
         let replaced = plan.right.is_some_and(|(_, replaces)| replaces);
         // With nothing open in a window too narrow for the sidebar, the list is the main view:
@@ -835,6 +849,7 @@ impl Render for Shell {
         let _ = tall;
 
         root.child(self.rail(snapshot, window, cx))
+            .when(overview > 0., |root| root.child(self.discord_overview(snapshot, overview, window, cx)))
             .children(plan.sidebar.map(|width| {
                 self.sidebar(snapshot, width, window, cx).child(self.resize_handle(Edge::Sidebar, cx))
             }))
@@ -874,7 +889,7 @@ impl Render for Shell {
                 )
             })
             .children(self.switcher(window, cx))
-            .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), window, cx))
+            .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
     }
 }
@@ -910,6 +925,21 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discord_columns_keep_a_readable_conversation_and_yield_to_narrow_windows() {
+        let minimum = RAIL_WIDTH + SIDEBAR_WIDTH + 280. + CONVERSATION_MIN;
+        assert_eq!(discord_overview_width(minimum, SIDEBAR_WIDTH, false, None, true), 280.);
+        assert_eq!(discord_overview_width(minimum - 1., SIDEBAR_WIDTH, false, None, true), 0.);
+        assert_eq!(discord_overview_width(1800., SIDEBAR_WIDTH, true, None, true), 0.);
+        assert_eq!(discord_overview_width(1800., SIDEBAR_WIDTH, false, None, false), 0.);
+        assert_eq!(discord_overview_width(minimum, SIDEBAR_WIDTH, false, Some(RIGHT_WIDTH), true), 0.);
+        let window = minimum + RIGHT_WIDTH;
+        let overview = discord_overview_width(window, SIDEBAR_WIDTH, false, Some(RIGHT_WIDTH), true);
+        let planned = plan(window - overview, SIDEBAR_WIDTH, false, Some(RIGHT_WIDTH));
+        assert_eq!(planned.right, Some((RIGHT_WIDTH, false)));
+        assert_eq!(conversation_width(window - overview, &planned), CONVERSATION_MIN);
+    }
 
     #[test]
     fn the_conversation_gives_up_width_then_the_right_pane_replaces_it_then_the_sidebar_leaves() {
