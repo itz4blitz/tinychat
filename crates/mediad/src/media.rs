@@ -1,8 +1,9 @@
-//! The 20 ms loop of a joined call. One thread owns the UDP socket, the codecs and the devices:
-//! between ticks it takes packets off the socket into each sender's jitter buffer; on the tick
-//! it sends one frame of the microphone and plays one frame of everyone mixed.
+//! The 20 ms loop of a joined call. One thread owns the UDP socket and the codecs: between ticks
+//! it takes packets off the socket into each sender's jitter buffer; on the tick it sends one
+//! frame of the microphone and plays one frame of everyone mixed. Opening or replacing an audio
+//! device happens on another thread. The tick only swaps in a device that is already open.
 
-use crate::audio::{level, Audio, AudioError};
+use crate::audio::{level, open_fresh, route_moved, Audio, AudioError, Fresh, Retired};
 use crate::cue::Playing;
 use crate::dave::{Dave, Outgoing};
 use crate::jitter::{Jitter, Pop};
@@ -16,8 +17,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const TICK: Duration = Duration::from_millis(20);
@@ -80,8 +82,10 @@ struct Stream {
     rebuilt: u64,
 }
 
-pub const NO_MICROPHONE: &str = "Plug in a microphone, or choose another in Microphone and speaker.";
-pub const NO_SPEAKER: &str = "Plug in headphones or a speaker, or choose another in Microphone and speaker.";
+pub const NO_MICROPHONE: &str =
+    "Plug in a microphone, or choose another in Microphone and speaker.";
+pub const NO_SPEAKER: &str =
+    "Plug in headphones or a speaker, or choose another in Microphone and speaker.";
 pub const MICROPHONE_FAULT: &str =
     "The microphone didn't start. Reconnect it or choose another in Microphone and speaker, then try again.";
 pub const SPEAKER_FAULT: &str =
@@ -117,6 +121,10 @@ struct Loop {
     levels: (u8, u8),
     /// The cue being played under the voices.
     cue: Option<Playing>,
+    /// Opens devices away from this thread.
+    devices: DeviceDesk,
+    /// Housekeeping asked for a reopen. The tick posts it; it does not open anything itself.
+    reopen_wanted: bool,
 }
 
 impl Loop {
@@ -133,7 +141,9 @@ impl Loop {
         let stream = match self.streams.entry(packet.ssrc) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let Some(decoder) = Decoder::new() else { return };
+                let Some(decoder) = Decoder::new() else {
+                    return;
+                };
                 entry.insert(Stream {
                     jitter: Jitter::default(),
                     decoder,
@@ -153,9 +163,20 @@ impl Loop {
             stream.heard |= packet.payload != SILENCE;
             return;
         }
-        let user = self.setup.users.lock().unwrap().get(&packet.ssrc).and_then(|id| id.parse().ok());
+        let user = self
+            .setup
+            .users
+            .lock()
+            .unwrap()
+            .get(&packet.ssrc)
+            .and_then(|id| id.parse().ok());
         let mut again = Vec::new();
-        let frame = self.setup.dave.lock().unwrap().decrypt(user, &packet.payload, &mut again);
+        let frame = self
+            .setup
+            .dave
+            .lock()
+            .unwrap()
+            .decrypt(user, &packet.payload, &mut again);
         if !again.is_empty() {
             let _ = self.setup.report.send(FromMedia::Dave(again));
         }
@@ -177,7 +198,10 @@ impl Loop {
 
     fn say(&self, speaking: bool) {
         let _ = self.setup.report.send(FromMedia::Speaking(speaking));
-        out::send(&MediaResponse::Speaking { user_id: self.setup.user_id.clone(), speaking });
+        out::send(&MediaResponse::Speaking {
+            user_id: self.setup.user_id.clone(),
+            speaking,
+        });
     }
 
     fn encode(&mut self, frame: &[i16; FRAME_SAMPLES]) {
@@ -264,7 +288,10 @@ impl Loop {
                         Pop::Packet(packet) => stream.decoder.decode(Some(&packet), 0, &mut pcm),
                         Pop::Lost => {
                             // The packet after the hole may carry a copy of what was lost.
-                            let rebuilt = stream.jitter.next().and_then(|next| stream.decoder.recover(next, &mut pcm));
+                            let rebuilt = stream
+                                .jitter
+                                .next()
+                                .and_then(|next| stream.decoder.recover(next, &mut pcm));
                             stream.rebuilt += u64::from(rebuilt.is_some());
                             rebuilt.or_else(|| stream.decoder.decode(None, FRAME, &mut pcm))
                         }
@@ -336,26 +363,83 @@ impl Loop {
     }
 
     fn devices(&self) {
-        let (input, output) = (self.setup.audio.input.clone(), self.setup.audio.output.clone());
+        let (input, output) = (
+            self.setup.audio.input.clone(),
+            self.setup.audio.output.clone(),
+        );
         out::send(&MediaResponse::Devices { input, output });
     }
 
-    /// Opens the devices again. A named device that is gone gives way to the system default, and
-    /// only having no device at all ends the call.
-    fn reopen(&mut self) -> bool {
-        let audio = &mut self.setup.audio;
-        let opened = audio.reopen().or_else(|err| {
-            eprintln!("mediad: {err:?}; falling back to the system default devices");
-            audio.want_input = None;
-            audio.want_output = None;
-            audio.reopen()
-        });
-        match opened {
-            Ok(()) => {
+    /// Takes a finished reopen, if one is ready, and posts the next one. Never opens a device
+    /// itself: that work is already running, or is posted here and finishes on a later tick.
+    fn service_devices(&mut self) -> bool {
+        loop {
+            let note = match self.devices.notes.try_recv() {
+                Ok(note) => note,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return false,
+            };
+            self.devices.busy = false;
+            if !self.apply_devices(note) {
+                return false;
+            }
+            if let Some(ask) = self.devices.queued.take() {
+                let _ = self.devices.orders.send(Order::Open(ask));
+                self.devices.busy = true;
+            }
+        }
+        if self.devices.busy {
+            return true;
+        }
+        let chosen = self.setup.controls.devices.lock().unwrap().take();
+        if let Some((input, output)) = chosen {
+            self.setup.audio.want_input = input;
+            self.setup.audio.want_output = output;
+            self.reopen_wanted = true;
+        }
+        if self.setup.audio.device_broken() {
+            self.reopen_wanted = true;
+        }
+        let poll_route = self.ticks.is_multiple_of(SECOND) && self.setup.audio.on_devices();
+        if self.reopen_wanted || poll_route {
+            let audio = &self.setup.audio;
+            let ask = OpenAsk {
+                want_input: audio.want_input.clone(),
+                want_output: audio.want_output.clone(),
+                current_input: audio.input.clone(),
+                current_output: audio.output.clone(),
+                sides: audio.sides(),
+                broken: audio.device_broken(),
+                force: self.reopen_wanted,
+                mic_running: audio.mic_running(),
+                simulated: !audio.on_devices(),
+                pause: Duration::ZERO,
+            };
+            self.reopen_wanted = false;
+            let _ = self.devices.orders.send(Order::Open(ask));
+            self.devices.busy = true;
+        }
+        true
+    }
+
+    fn apply_devices(&mut self, note: Note) -> bool {
+        match note {
+            Note::Fresh { fresh, fell_back } => {
+                if fell_back {
+                    self.setup.audio.want_input = None;
+                    self.setup.audio.want_output = None;
+                }
+                let retired = self.setup.audio.install(fresh);
+                let _ = self.devices.orders.send(Order::Retire(retired));
                 self.devices();
                 true
             }
-            Err(err) => {
+            Note::Same => {
+                self.devices();
+                true
+            }
+            Note::Quiet => true,
+            Note::Failed(err) => {
                 let (reason, detail) = failure(err);
                 let _ = self.setup.report.send(FromMedia::Fatal(reason, detail));
                 false
@@ -363,18 +447,8 @@ impl Loop {
         }
     }
 
-    /// Once a second: what does not need 20 ms timing.
+    /// Once a second: what does not need 20 ms timing. Device reopen is not in here.
     fn housekeeping(&mut self) -> bool {
-        let chosen = self.setup.controls.devices.lock().unwrap().take();
-        if let Some((input, output)) = chosen {
-            self.setup.audio.want_input = input;
-            self.setup.audio.want_output = output;
-            if !self.reopen() {
-                return false;
-            }
-        } else if self.setup.audio.moved() && !self.reopen() {
-            return false;
-        }
         if self.setup.microphone_unasked {
             match microphone() {
                 Some(Microphone::Denied) => {
@@ -388,9 +462,7 @@ impl Loop {
                     // on hearing silence, so the devices are opened afresh.
                     self.setup.microphone_unasked = false;
                     eprintln!("mediad: microphone access was granted");
-                    if !self.reopen() {
-                        return false;
-                    }
+                    self.reopen_wanted = true;
                 }
             }
         }
@@ -402,7 +474,9 @@ impl Loop {
             let _ = self.setup.socket.send(&probe);
         }
         let users = self.setup.users.lock().unwrap();
-        self.streams.retain(|ssrc, stream| users.contains_key(ssrc) || stream.last_packet.elapsed() < Duration::from_secs(60));
+        self.streams.retain(|ssrc, stream| {
+            users.contains_key(ssrc) || stream.last_packet.elapsed() < Duration::from_secs(60)
+        });
         true
     }
 
@@ -413,10 +487,14 @@ impl Loop {
         while !self.setup.stop.load(Ordering::Relaxed) {
             let now = Instant::now();
             if now < next {
-                let _ = self.setup.socket.set_read_timeout(Some((next - now).max(Duration::from_micros(200))));
+                let _ = self
+                    .setup
+                    .socket
+                    .set_read_timeout(Some((next - now).max(Duration::from_micros(200))));
                 match self.setup.socket.recv(&mut datagram) {
                     Ok(len) => self.receive(&datagram[..len]),
-                    Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                    Err(err)
+                        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                     // An ICMP error surfaces here once per packet we sent; it is not ours to act on.
                     Err(_) => std::thread::sleep(Duration::from_millis(1)),
                 }
@@ -430,11 +508,17 @@ impl Loop {
             self.ticks += 1;
             let input = self.capture();
             let output = self.play();
-            if self.ticks.is_multiple_of(5) && self.setup.controls.metering() && (input, output) != self.levels {
+            if self.ticks.is_multiple_of(5)
+                && self.setup.controls.metering()
+                && (input, output) != self.levels
+            {
                 self.levels = (input, output);
                 out::send(&MediaResponse::Levels { input, output });
             }
             if self.ticks.is_multiple_of(SECOND) && !self.housekeeping() {
+                break;
+            }
+            if !self.service_devices() {
                 break;
             }
         }
@@ -446,7 +530,10 @@ impl Loop {
         }
         for (ssrc, stream) in &self.streams {
             let (jitter, rebuilt) = (&stream.jitter, stream.rebuilt);
-            eprintln!("mediad: ssrc {ssrc}: {} lost ({rebuilt} rebuilt), {} late", jitter.lost, jitter.late);
+            eprintln!(
+                "mediad: ssrc {ssrc}: {} lost ({rebuilt} rebuilt), {} late",
+                jitter.lost, jitter.late
+            );
         }
     }
 }
@@ -456,7 +543,10 @@ impl Loop {
 pub fn run(setup: Setup) -> Audio {
     let Some(encoder) = Encoder::new() else {
         eprintln!("mediad: the Opus encoder could not be created");
-        let fatal = FromMedia::Fatal(CallFailure::Engine, "The call engine could not start. Try again.".to_owned());
+        let fatal = FromMedia::Fatal(
+            CallFailure::Engine,
+            "The call engine could not start. Try again.".to_owned(),
+        );
         let _ = setup.report.send(fatal);
         return setup.audio;
     };
@@ -472,7 +562,170 @@ pub fn run(setup: Setup) -> Audio {
         keepalive: 0,
         levels: (0, 0),
         cue: None,
+        devices: DeviceDesk::start(),
+        reopen_wanted: false,
     };
     state.run();
+    state.devices.stop();
     state.setup.audio
+}
+
+/// What the call thread asks the device thread to do.
+enum Order {
+    Open(OpenAsk),
+    Retire(Retired),
+    Stop,
+}
+
+struct OpenAsk {
+    want_input: Option<String>,
+    want_output: Option<String>,
+    current_input: String,
+    current_output: String,
+    sides: (bool, bool),
+    broken: bool,
+    /// The user picked a device, the callback reported a failure, or permission was just granted.
+    force: bool,
+    mic_running: bool,
+    simulated: bool,
+    /// Test-only wait before the open, so the caller can show the tick is not inside it.
+    pause: Duration,
+}
+
+enum Note {
+    Fresh {
+        fresh: Fresh,
+        fell_back: bool,
+    },
+    /// Stand-in devices: nothing was opened, and the call should say which names it is using.
+    Same,
+    /// The route was checked and it has not moved.
+    Quiet,
+    Failed(AudioError),
+}
+
+fn satisfy(ask: OpenAsk) -> Note {
+    if !ask.pause.is_zero() {
+        thread::sleep(ask.pause);
+    }
+    if ask.simulated {
+        return if ask.force { Note::Same } else { Note::Quiet };
+    }
+    let moved = ask.broken
+        || route_moved(
+            &ask.want_input,
+            &ask.current_input,
+            &ask.want_output,
+            &ask.current_output,
+            ask.sides,
+        );
+    if !ask.force && !moved {
+        return Note::Quiet;
+    }
+    match open_fresh(
+        ask.want_input.as_deref(),
+        ask.want_output.as_deref(),
+        ask.sides,
+        ask.mic_running,
+    ) {
+        Ok(fresh) => Note::Fresh {
+            fresh,
+            fell_back: false,
+        },
+        Err(err) => {
+            eprintln!("mediad: {err:?}; falling back to the system default devices");
+            match open_fresh(None, None, ask.sides, ask.mic_running) {
+                Ok(fresh) => Note::Fresh {
+                    fresh,
+                    fell_back: true,
+                },
+                Err(err) => Note::Failed(err),
+            }
+        }
+    }
+}
+
+struct DeviceDesk {
+    orders: mpsc::Sender<Order>,
+    notes: mpsc::Receiver<Note>,
+    busy: bool,
+    queued: Option<OpenAsk>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl DeviceDesk {
+    fn start() -> DeviceDesk {
+        let (orders_tx, orders_rx) = mpsc::channel();
+        let (notes_tx, notes_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("mediad-devices".to_owned())
+            .spawn(move || {
+                while let Ok(order) = orders_rx.recv() {
+                    match order {
+                        Order::Open(ask) => {
+                            let _ = notes_tx.send(satisfy(ask));
+                        }
+                        Order::Retire(retired) => drop(retired),
+                        Order::Stop => break,
+                    }
+                }
+            })
+            .expect("the device thread starts");
+        DeviceDesk {
+            orders: orders_tx,
+            notes: notes_rx,
+            busy: false,
+            queued: None,
+            join: Some(join),
+        }
+    }
+
+    fn stop(&mut self) {
+        let _ = self.orders.send(Order::Stop);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for DeviceDesk {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    #[test]
+    fn reopening_a_device_does_not_block_the_caller() {
+        let desk = DeviceDesk::start();
+        let started = Instant::now();
+        desk.orders
+            .send(Order::Open(OpenAsk {
+                want_input: None,
+                want_output: None,
+                current_input: String::new(),
+                current_output: String::new(),
+                sides: (true, true),
+                broken: false,
+                force: true,
+                mic_running: true,
+                simulated: true,
+                pause: Duration::from_millis(200),
+            }))
+            .unwrap();
+        assert!(desk.notes.try_recv().is_err(), "the open has not finished");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "posting the open stalled the caller"
+        );
+        let note = desk
+            .notes
+            .recv_timeout(Duration::from_millis(500))
+            .expect("the open finished");
+        assert!(matches!(note, Note::Same));
+        drop(desk);
+    }
 }
