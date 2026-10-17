@@ -1,4 +1,4 @@
-//! Moving pictures: animated GIF, animated WebP and APNG, decoded to frames at the size they
+//! Moving pictures: animated GIF, WebP, APNG and (with the GUI) Lottie, decoded at the size they
 //! are drawn. A file's header is read first, without decoding, for its canvas, frame count and
 //! how many times it plays; that decides the size and how many frames are kept so one
 //! animation never passes its [`Limits`]. Frames are scaled down one at a time as they are
@@ -42,7 +42,7 @@ pub struct Sniff {
 }
 
 /// Reads a file's header for whether it moves. `None` for a still picture, one frame, or a
-/// file that is not one of the three formats.
+/// file that is not a supported animation format.
 pub fn sniff(bytes: &[u8]) -> Option<Sniff> {
     let found = if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         gif(bytes)
@@ -51,7 +51,10 @@ pub fn sniff(bytes: &[u8]) -> Option<Sniff> {
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         apng(bytes)
     } else {
-        None
+        #[cfg(feature = "gui")]
+        { crate::lottie::sniff(bytes) }
+        #[cfg(not(feature = "gui"))]
+        { None }
     }?;
     (found.frames > 1 && found.width > 0 && found.height > 0).then_some(found)
 }
@@ -163,7 +166,7 @@ pub struct Plan {
 
 /// The pixels of a `canvas` scaled to `edge` on its longer side, then cut to `crop` times its
 /// width from the top.
-fn scaled(canvas: (u32, u32), edge: u32, crop: Option<f32>) -> (u32, u32) {
+pub(crate) fn scaled(canvas: (u32, u32), edge: u32, crop: Option<f32>) -> (u32, u32) {
     let (w, h) = (u64::from(canvas.0.max(1)), u64::from(canvas.1.max(1)));
     let edge = u64::from(edge.max(1));
     let (width, height) = if w >= h { (edge, (h * edge / w).max(1)) } else { ((w * edge / h).max(1), edge) };
@@ -230,6 +233,9 @@ fn shown_for(delay: image::Delay) -> Duration {
 /// Decodes the frames of a moving picture per its plan. `None` when it does not move, does not
 /// fit, or will not decode.
 pub fn decode(bytes: &[u8], edge: u32, crop: Option<f32>, limits: Limits) -> Option<Animation> {
+    #[cfg(feature = "gui")]
+    if crate::lottie::candidate(bytes) { return crate::lottie::decode(bytes, edge, crop, Some(limits)); }
+
     let sniff = sniff(bytes)?;
     let plan = plan(&sniff, edge, crop, limits)?;
     let source = || Cursor::new(bytes);

@@ -519,7 +519,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
     }
 }
 
-/// A sticker is drawn like an attached picture. Lottie ones are a file nobody can draw here.
+/// A sticker is drawn like an attached picture; the shell renders Lottie JSON with tlottie.
 fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
     let (kind, url, mime) = match sticker.format_type {
         3 => (MediaKind::File, format!("{}/stickers/{}.json", model::cdn(), sticker.id), "application/json"),

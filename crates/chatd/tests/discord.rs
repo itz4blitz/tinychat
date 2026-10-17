@@ -2742,14 +2742,15 @@ fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them
     assert_eq!(posted[1].body["content"], "https://tenor.com/view/cat-typing-1");
     assert_eq!(posted[1].body["allowed_mentions"]["replied_user"], true);
     // The server's own emoji and stickers, from READY: what lost its boost, an animated one
-    // (Nitro's), one only another role may use and the Lottie sticker are not offered, and a
-    // DM offers none without Nitro. Nothing is asked.
+    // (Nitro's), and one only another role may use are not offered. Lottie stickers
+    // have a native renderer; a DM still offers no server emoji without Nitro. Nothing is asked.
     let before = world.discord.asked().len();
     let emoji = catalog(protocol::CatalogKind::Emoji, "", Some("4000"));
     assert_eq!(emoji.iter().map(|item| (item.id.as_str(), item.name.as_str())).collect::<Vec<_>>(), [("emoji:5101", ":ferris:")]);
     assert!(catalog(protocol::CatalogKind::Emoji, "", None).is_empty());
     let stickers = catalog(protocol::CatalogKind::Stickers, "", Some("4000"));
-    assert_eq!(stickers.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["5201"]);
+    assert_eq!(stickers.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["5201", "5202"]);
+    assert_eq!(stickers[1].file.as_ref().unwrap().kind, protocol::MediaKind::File, "Lottie JSON is offered to the native renderer");
     assert_eq!(world.discord.asked().len(), before);
     let pick = protocol::Pick { kind: protocol::CatalogKind::Stickers, id: "5201".into() };
     send_with(&world, "4101", "77005", "", None, protocol::Outgoing { pick: Some(pick), ..Default::default() });
