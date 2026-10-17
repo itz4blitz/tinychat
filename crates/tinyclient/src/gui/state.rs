@@ -272,7 +272,7 @@ impl Shell {
                 presence: Some(people::presence_slot),
                 typing: Some(people::typing_slot),
                 call_dock: Some(call::dock),
-                search: None,
+                search: Some(Self::open_message_search),
             },
             layout_state: layout::State::default(),
             sidebar_state: sidebar::State::new(cx),

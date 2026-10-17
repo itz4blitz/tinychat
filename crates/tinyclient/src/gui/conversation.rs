@@ -262,6 +262,9 @@ pub struct Pane {
     places: crate::gui::pane::Memory<Place>,
     /// The next open starts from the page around this message: more is unread than a page holds.
     around: Option<String>,
+    /// A search hit asked for this message before its conversation opened; it wins over where
+    /// reading stopped.
+    landing: Option<String>,
     /// Nothing to type in: the messages take the focus on the next draw.
     wants_focus: bool,
     /// How far the files of each of my pending messages have gone, by `client_id`.
@@ -333,6 +336,7 @@ impl Pane {
             land: false,
             places: crate::gui::pane::Memory::default(),
             around: None,
+            landing: None,
             wants_focus: false,
             uploads: HashMap::new(),
             pending_at: HashMap::new(),
@@ -362,8 +366,11 @@ impl Pane {
             return;
         }
         // More unread than a page holds: the first page is the one around where reading stopped.
+        // A search hit's landing wins over it.
         let around = conversation.last_read.clone().filter(|_| conversation.unread > PAGE / 2);
-        self.around = around;
+        if self.landing.is_none() {
+            self.around = around;
+        }
         self.start(conversation.key.clone(), &conversation.title, conversation.kind, me, None, cx);
         self.wants_focus = !typing;
         if let Some(open) = self.open.as_mut() {
@@ -385,7 +392,7 @@ impl Pane {
         root: Option<(Rc<Message>, u32)>,
         cx: &mut Context<Self>,
     ) {
-        let around = self.around.take();
+        let around = self.landing.take().or(self.around.take());
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);
@@ -746,12 +753,17 @@ impl Pane {
     }
 
     /// Scrolls to a message, reading the history around it first if it is not held.
-    fn jump_to(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn jump_to(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.window.position(id).is_some() {
             self.reveal(id, cx);
         } else {
             self.load(Page::Around { id: id.to_owned() }, Purpose::Jump(id.to_owned()), cx);
         }
+    }
+
+    /// The next open starts on this message: a search hit opening its conversation.
+    pub(in crate::gui) fn land_next(&mut self, id: String) {
+        self.landing = Some(id);
     }
 
     fn reveal(&mut self, id: &str, cx: &mut Context<Self>) {

@@ -13,17 +13,20 @@ use crate::gui::layout::{RightKind, RightPane};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
+use crate::view::{age, now};
 use gpui::{div, prelude::*, px, AnyElement, Context, Entity, MouseButton, Window};
-use protocol::{ConversationKind, Key, Link, Message, Request, Response};
+use protocol::{ConversationKind, Key, Link, Message, MessageHit, Request, Response};
 use std::rc::Rc;
 
-/// What the window keeps of the right pane.
+/// The window keeps of the right pane.
 #[derive(Default)]
 pub struct Side {
     pub stack: Stack,
     pub switches: pane::Switches,
     /// Threads put away on leaving their conversation, by conversation.
     threads: pane::Memory<Rc<Message>>,
+    /// The message search's page: what was typed, and what the cache holds for it.
+    pub search: Option<SearchPage>,
     /// The conversation the stack was last fitted to.
     fitted: Option<Key>,
     /// The kind this view last put in the layout's slot, so another view's change can be told
@@ -40,6 +43,13 @@ pub struct Side {
     asked: bool,
     /// The conversation region's width in the last frame, for what its strip can hold.
     room: std::cell::Cell<f32>,
+}
+
+/// One message search's page: what was typed, and what the cache holds for it.
+#[derive(Default)]
+pub struct SearchPage {
+    pub words: String,
+    pub hits: Vec<MessageHit>,
 }
 
 impl Side {
@@ -315,6 +325,51 @@ impl Shell {
         self.install(cx);
     }
 
+    /// The switcher's "Search messages" row: the pane opens at once and the cache is asked.
+    pub(in crate::gui) fn open_message_search(&mut self, words: String, cx: &mut Context<Self>) {
+        let side = &mut self.conversation_state.side;
+        side.search = Some(SearchPage { words: words.clone(), hits: Vec::new() });
+        side.stack = pane::open(&side.stack, Layer::Search);
+        self.install(cx);
+        self.off_thread(
+            cx,
+            {
+                let asked = words.clone();
+                move || ask(&Request::SearchMessages { conversation: None, network: None, query: asked, limit: protocol::PAGE_LIMIT })
+            },
+            move |this, answer, cx| {
+                let Ok(Response::MessageHits { hits }) = answer else {
+                    return;
+                };
+                let Some(page) = this.conversation_state.side.search.as_mut() else {
+                    return;
+                };
+                if page.words != words {
+                    return;
+                }
+                page.hits = hits;
+                cx.notify();
+            },
+        );
+    }
+
+    /// A search hit was clicked: its conversation opens on the message, or, being open already,
+    /// jumps to it.
+    pub(in crate::gui) fn open_search_hit(&mut self, hit: &MessageHit, cx: &mut Context<Self>) {
+        let key = hit.conversation.clone();
+        if self.open.as_ref() == Some(&key) {
+            if let Some(pane) = self.conversation_state.pane.get() {
+                pane.update(cx, |pane, cx| pane.jump_to(&hit.message_id, cx));
+            }
+            return;
+        }
+        if let Some(pane) = self.conversation_state.pane.get() {
+            pane.update(cx, |pane, _| pane.land_next(hit.message_id.clone()));
+        }
+        let title = if hit.title.is_empty() { hit.conversation.id.clone() } else { hit.title.clone() };
+        self.select(key, &title, cx);
+    }
+
     /// For slice D's Details: the open conversation's pinned messages, over Details.
     #[allow(dead_code)]
     pub(in crate::gui) fn open_pins(&mut self, cx: &mut Context<Self>) {
@@ -514,7 +569,7 @@ fn draw_side(shell: &Shell, window: &mut Window, cx: &mut Context<Shell>) -> Any
         Layer::Members(_) => shell.pane_members(window, cx),
         Layer::Thread { conversation, .. } => draw_thread(shell, conversation, cx),
         Layer::Pinned(conversation) => draw_pins(shell, conversation, cx),
-        Layer::Search => div().into_any_element(),
+        Layer::Search => draw_search(shell, cx),
     };
     let crumb = stack.push.as_ref().and(stack.base.as_ref()).map(|base| crumb(base.title(), cx));
     div()
@@ -556,6 +611,74 @@ fn crumb(base: &'static str, cx: &mut Context<Shell>) -> AnyElement {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|shell, _, _, cx| shell.pop(cx))),
         )
+        .into_any_element()
+}
+
+/// The message search's pane: what was asked, and the cache's hits, newest first. Every hit is
+/// the cache's word for it, so a row says "cached"; the networks are a later ask.
+fn draw_search(shell: &Shell, cx: &mut Context<Shell>) -> AnyElement {
+    let Some(page) = &shell.conversation_state.side.search else {
+        return div().into_any_element();
+    };
+    let head = div()
+        .h(px(44.))
+        .flex_none()
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .border_b_1()
+        .border_color(theme::hairline())
+        .child(glyph("icons/search.svg", 14., theme::text_soft()))
+        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(page.words.clone()))
+        .child(div().type_small().text_color(theme::text_soft()).child("cached"));
+    let body = if page.hits.is_empty() {
+        empty_state("icons/search.svg", "Nothing in the cache yet.", "The networks are not asked yet.")
+            .into_any_element()
+    } else {
+        let mut rows = div().id("search-hits").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().p(px(4.));
+        for (ix, hit) in page.hits.iter().enumerate() {
+            let clicked = hit.clone();
+            rows = rows.child(
+                div()
+                    .id(("hit", ix))
+                    .flex_none()
+                    .px(px(10.))
+                    .py(px(8.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_search_hit(&clicked, cx)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(hit.title.clone()))
+                            .child(div().flex_none().type_small().text_color(theme::text_soft()).child(age(now(), hit.sent))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(hit.snippet.clone()))
+                            .child(div().flex_none().type_micro().text_color(theme::text_soft()).child("cached")),
+                    ),
+            );
+        }
+        rows.into_any_element()
+    };
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(theme::canvas())
+        .child(head)
+        .child(body)
         .into_any_element()
 }
 
