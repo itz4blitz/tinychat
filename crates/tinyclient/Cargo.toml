@@ -22,12 +22,15 @@ smallvec = { version = "1.6", optional = true }
 # Reads `mediad --devices` for Settings › Audio & video. Already in the tree through protocol.
 serde_json = { workspace = true, optional = true }
 
+# Native CPU rendering of Discord Lottie stickers, pinned for reproducible builds.
+tlottie = { git = "https://github.com/dkaraush/tlottie", rev = "92df98dc209bc39b1e567ec74a8c86a0af5239de", optional = true }
+
 [dev-dependencies]
 # The frame decoder's tests run without the window.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [features]
-gui = ["dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:windows-sys"]
+gui = ["dep:tlottie", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:windows-sys"]
 # Adds `--shot out.png`: render the window to a file and quit, for design review without
 # Screen Recording permission. Pulls GPUI's test support, so it is not part of `gui`.
 gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]

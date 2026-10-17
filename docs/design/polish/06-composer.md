@@ -182,6 +182,18 @@ removing a file (Discord) and replacing a photo (Telegram) are P2.
   are computed from the trigger bounds before layout. Grid = `uniform_list` of rows (9 emoji / 1 justified GIF row / 4
   stickers), so ~12 rows exist; images decode in `Images` only for visible rows and drop on scroll-off; the entity and
   `media/<net>/pick/` die on close.
+- **Lottie stickers**: tlottie's CPU renderer parses cached Discord JSON and
+  supplies frames to the same image cache as GIF/APNG. The GUI-only dependency
+  is pinned in Cargo.lock; daemons and non-GUI builds do not link it. The picker
+  registers Lottie JSON with the same sticker media id used by received messages.
+  Decode runs off the UI thread, respects autoplay/Reduce Motion and existing
+  frame budgets, and retains frame zero when animation is disabled or cannot fit.
+  Inputs are at most 2 MiB, source dimensions 4096, duration 1000 source frames,
+  and rate 0.1–240 fps. Rendering is capped at a 512-pixel edge, retains at most
+  the cache's frame/byte allowance, and stops between frames after two seconds.
+  Transparent premultiplied RGBA output becomes straight BGRA for GPUI. External
+  files/fonts named in animation JSON are never loaded. Telegram TGS support is
+  unchanged; this path handles JSON Lottie stickers.
 - **GIF decode rule**: every cell is a first-frame still (`images.rs` reads index 0 only). The one hovered cell swaps to
   `img()` of the provider's smallest GIF rendition (Tenor `tinygif`, ~220 px): this rev's `img()` steps frames itself
   and stops under `reduce_motion()`. Played only if width × height × 4 × frames ≤ 8 MB, else it stays still; dropped

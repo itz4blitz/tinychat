@@ -457,11 +457,12 @@ fn nullable_yes<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
 }
 
 /// A sticker's picture from the media proxy, registered as a message shows it (`content.rs`), so
-/// the picker and a sent sticker share one file. `None` for a Lottie one, which has no still.
+/// the picker and a sent sticker share one file. Lottie JSON is rendered by the shell.
 pub fn sticker(id: &str, format: u8) -> Option<(MediaFile, String)> {
     let (kind, url) = match format {
         1 => (MediaKind::Image, format!("{}/stickers/{id}.png?size=160", media())),
         2 => (MediaKind::Image, apng_sticker(id)),
+        3 => (MediaKind::File, format!("{}/stickers/{id}.json", cdn())),
         4 => (MediaKind::Gif, format!("{}/stickers/{id}.gif", media())),
         _ => return None,
     };

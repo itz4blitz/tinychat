@@ -10,6 +10,8 @@ mod update;
 mod frames;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "gui")]
+mod lottie;
 mod view;
 
 use client::ask;

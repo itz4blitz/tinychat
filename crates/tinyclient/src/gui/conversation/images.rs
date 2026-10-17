@@ -128,6 +128,10 @@ pub struct Decoded {
 /// whole. `crop` keeps only the top of a very tall picture: that many times its width.
 /// `None` when the file is missing or is not a picture.
 pub fn decode(path: &Path, edge: u32, crop: Option<f32>) -> Option<Decoded> {
+    if let Some(bytes) = crate::lottie::read(path) {
+        let mut image = crate::lottie::decode(&bytes, edge, crop, None)?;
+        return Some(Decoded { width: image.width, height: image.height, bgra: image.frames.pop()?.0 });
+    }
     if !looks_like_a_picture(path) {
         return None;
     }
@@ -287,13 +291,15 @@ pub fn load(path: &Path, edge: u32, crop: Option<f32>, frames: Option<Limits>) -
 }
 
 /// Whether the start of a file says it may move: a GIF, a WebP marked animated, a PNG with an
-/// animation chunk before its pixels. Only those are read whole.
+/// animation chunk before its pixels, or a possible Lottie JSON object. Only those
+/// are read whole; Lottie parsing applies its own stricter input limit.
 fn might_move(path: &Path) -> bool {
     use std::io::Read;
     let mut head = vec![0u8; 4096];
     let read = std::fs::File::open(path).and_then(|mut file| file.read(&mut head)).unwrap_or(0);
     let head = &head[..read];
-    head.starts_with(b"GIF8")
+    crate::lottie::candidate(head)
+        || head.starts_with(b"GIF8")
         || (head.starts_with(b"RIFF") && head.get(8..16) == Some(b"WEBPVP8X") && head.get(20).is_some_and(|flags| flags & 0x02 != 0))
         || (head.starts_with(b"\x89PNG") && head.windows(4).take_while(|chunk| *chunk != b"IDAT").any(|chunk| chunk == b"acTL"))
 }
@@ -691,6 +697,20 @@ mod tests {
 
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    #[test]
+    fn a_cached_lottie_sticker_animates_or_keeps_its_first_frame() {
+        let path = std::env::temp_dir().join(format!("tc-lottie-{}", std::process::id()));
+        std::fs::write(&path, include_bytes!("../../../tests/fixtures/moving.lottie")).unwrap();
+        let (playing, moves) = load(&path, 16, None, Some(frames::SMALL)).unwrap();
+        assert_eq!((playing.frame_count(), moves), (4, Moves::Playing));
+        anim::MESSAGES.give(anim::bytes_of(&playing));
+        for limits in [None, Some(Limits { bytes: 0, frames: 2 })] {
+            let (still, moves) = load(&path, 16, None, limits).unwrap();
+            assert_eq!((still.frame_count(), moves), (1, Moves::Still));
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

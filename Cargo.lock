@@ -9086,6 +9086,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
+ "tlottie",
  "unicode-segmentation",
  "windows-sys 0.61.2",
 ]
@@ -9105,6 +9106,11 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
+name = "tlottie"
+version = "1.0.6"
+source = "git+https://github.com/dkaraush/tlottie?rev=92df98dc209bc39b1e567ec74a8c86a0af5239de#92df98dc209bc39b1e567ec74a8c86a0af5239de"
 
 [[package]]
 name = "tls_codec"
