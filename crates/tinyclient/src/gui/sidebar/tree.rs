@@ -56,8 +56,8 @@ pub enum Reveal {
     OptedOut,
     /// "12 quiet channels" at the end of a Slack section.
     Quiet(String),
-    /// "4 more threads" under a channel: opens nothing yet, it says how many.
-    Threads,
+    /// Toggle followed threads under this channel.
+    Threads(Key),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -96,6 +96,8 @@ pub struct Rules<'a> {
     pub closed: Option<&'a HashSet<String>>,
     /// Slack sections whose quiet channels are shown.
     pub quiet_shown: Option<&'a HashSet<String>>,
+    /// Channels whose followed threads are expanded this session.
+    pub threads_shown: Option<&'a HashSet<Key>>,
     /// The home's Unread segment: only rows with news, the open one and starred ones.
     pub unread: bool,
 }
@@ -130,7 +132,8 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
     let mut quiet_threads: HashMap<&str, usize> = HashMap::new();
     for thread in conversations.iter().filter(|c| is_thread(c) && c.parent.as_ref().is_some_and(in_tree)) {
         let parent = thread.parent.as_deref().unwrap_or_default();
-        let shown = open == Some(&thread.key) || (!slack && thread.followed && thread.badge() != Badge::None);
+        let expanded = rules.threads_shown.is_some_and(|shown| shown.contains(&Key { id: parent.into(), ..space.clone() }));
+        let shown = open == Some(&thread.key) || (!slack && thread.followed && (expanded || thread.badge() != Badge::None));
         if shown {
             threads.entry(parent).or_default().push(thread);
         } else if !slack && thread.followed {
@@ -164,15 +167,16 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
                 }
             }
             rows.push(Row::Conversation { conversation: Rc::clone(conversation), depth });
+            let expanded = rules.threads_shown.is_some_and(|shown| shown.contains(&conversation.key));
             for (ix, thread) in under.iter().enumerate() {
-                if ix < THREADS_SHOWN || open == Some(&thread.key) {
+                if expanded || ix < THREADS_SHOWN || open == Some(&thread.key) {
                     rows.push(Row::Conversation { conversation: Rc::clone(thread), depth: depth + 1 });
                 }
             }
             let more = under.iter().enumerate().filter(|(ix, thread)| *ix >= THREADS_SHOWN && open != Some(&thread.key)).count() + quiet_threads.get(conversation.key.id.as_str()).copied().unwrap_or(0);
-            if more > 0 && !collapsed {
-                let words = if more == 1 { "1 more thread".to_owned() } else { format!("{more} more threads") };
-                rows.push(Row::Fold { words, reveal: Reveal::Threads, depth: depth + 1 });
+            if !slack && !collapsed && (more > 0 || expanded) {
+                let words = if expanded { "Show fewer threads".to_owned() } else if more == 1 { "1 more thread".to_owned() } else { format!("{more} more threads") };
+                rows.push(Row::Fold { words, reveal: Reveal::Threads(conversation.key.clone()), depth: depth + 1 });
             }
             if let Some(inside) = conversation.occupants.as_ref().filter(|_| occupied(conversation)) {
                 rows.extend(inside.people.iter().take(OCCUPANTS_SHOWN).map(|occupant| Row::Occupant { occupant: occupant.clone(), depth: depth + 1 }));
@@ -396,6 +400,44 @@ mod tests {
         // t0–t3 have news, t4 is followed and read, t5 was never joined.
         assert_eq!(rows(&[], all.clone(), None), ["general", ".t0", ".t1", ".t2", "2 more threads"]);
         assert_eq!(rows(&[], all, Some("t5")), ["general", ".t0", ".t1", ".t2", ".t5", "2 more threads"]);
+    }
+
+    #[test]
+    fn expanding_threads_reveals_read_and_overflow_threads_only_for_that_channel() {
+        use ConversationKind::{Channel, Thread};
+        let mut all = vec![channel("general", None, Channel), channel("other", None, Channel)];
+        for n in 0..7 {
+            let mut thread = channel(&format!("t{n}"), None, Thread);
+            thread.parent = Some(if n == 6 { "other" } else { "general" }.into());
+            thread.followed = n != 5;
+            thread.unread = u32::from(n < 4);
+            all.push(thread);
+        }
+        let shown = HashSet::from([key("general")]);
+        let rules = Rules { threads_shown: Some(&shown), ..Rules::default() };
+        assert_eq!(rows_with(&[], all.clone(), None, &rules), ["general", ".t0", ".t1", ".t2", ".t3", ".t4", "Show fewer threads", "other", "1 more thread"]);
+        // Collapsing keeps an open overflow thread visible, and hides read threads again.
+        assert_eq!(rows(&[], all.clone(), Some("t3")), ["general", ".t0", ".t1", ".t2", ".t3", "1 more thread", "other", "1 more thread"]);
+        let foreign = HashSet::from([Key { account: "another-account".into(), ..key("general") }]);
+        let rules = Rules { threads_shown: Some(&foreign), ..Rules::default() };
+        assert_eq!(rows_with(&[], all, None, &rules), ["general", ".t0", ".t1", ".t2", "2 more threads", "other", "1 more thread"]);
+    }
+
+    #[test]
+    fn one_read_thread_can_be_revealed_and_its_fold_targets_the_parent() {
+        use ConversationKind::{Channel, Thread};
+        let mut thread = channel("read", None, Thread);
+        thread.parent = Some("general".into());
+        thread.followed = true;
+        let all = vec![Rc::new(channel("general", None, Channel)), Rc::new(thread)];
+        let collapsed = flatten(&key("s"), &[], &all, None, 0, &Rules::default());
+        assert_eq!(shape(&collapsed), ["general", "1 more thread"]);
+        assert!(matches!(&collapsed[1], Row::Fold { reveal: Reveal::Threads(parent), .. } if parent == &key("general")));
+        let shown = HashSet::from([key("general")]);
+        let rules = Rules { threads_shown: Some(&shown), ..Rules::default() };
+        let expanded = flatten(&key("s"), &[], &all, None, 0, &rules);
+        assert_eq!(shape(&expanded), ["general", ".read", "Show fewer threads"]);
+        assert!(matches!(&expanded[2], Row::Fold { reveal: Reveal::Threads(parent), .. } if parent == &key("general")));
     }
 
     #[test]

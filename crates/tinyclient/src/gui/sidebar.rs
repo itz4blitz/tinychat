@@ -112,6 +112,7 @@ pub struct State {
     opened: HashSet<String>,
     closed: HashSet<String>,
     quiet_shown: HashSet<String>,
+    threads_shown: HashSet<Key>,
     muted_shown: HashSet<Key>,
     opted_shown: HashSet<Key>,
     /// The tree on show, flat. Rebuilt on collapse and when its data changes.
@@ -178,6 +179,7 @@ impl State {
             opened: HashSet::new(),
             closed: HashSet::new(),
             quiet_shown: HashSet::new(),
+            threads_shown: HashSet::new(),
             muted_shown: HashSet::new(),
             opted_shown: HashSet::new(),
             rows: Rc::new(Vec::new()),
@@ -439,6 +441,7 @@ impl Shell {
                     opened: Some(&state.opened),
                     closed: Some(&state.closed),
                     quiet_shown: Some(&state.quiet_shown),
+                    threads_shown: Some(&state.threads_shown),
                     unread: state.home_unread && space.network == Network::Slack,
                 };
                 tree::flatten(space, &tree.groups, &tree.conversations, self.open.as_ref(), depth, &rules)
@@ -547,6 +550,11 @@ impl Shell {
                     }
                     (tree::Reveal::OptedOut, Some(space)) => {
                         state.opted_shown.insert(space);
+                    }
+                    (tree::Reveal::Threads(channel), _) => {
+                        if !state.threads_shown.remove(&channel) {
+                            state.threads_shown.insert(channel);
+                        }
                     }
                     (tree::Reveal::Quiet(group), _) => {
                         state.quiet_shown.insert(group);
@@ -869,15 +877,13 @@ impl Shell {
                 self.action_row(("threads", ix), Some("icons/messages-square.svg"), "Threads".into(), *count > 0, trailing, focused)
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate(ix, cx)))
             }
-            Row::Fold { words, depth, reveal } => {
-                let quiet = *reveal == tree::Reveal::Threads;
+            Row::Fold { words, depth, .. } => {
                 let content = div()
                     .children(indent(*depth, 8.))
                     .gap(px(8.))
                     .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph("icons/ellipsis.svg", 14., theme::text_faint())))
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child(words.clone()));
                 list_row(("fold", ix), height, false, focused, content)
-                    .when(quiet, |row| row.cursor_default())
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.activate(ix, cx)))
             }
             Row::More { words, depth } => {
