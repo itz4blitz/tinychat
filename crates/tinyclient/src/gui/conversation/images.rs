@@ -139,9 +139,10 @@ pub fn decode(path: &Path, edge: u32, crop: Option<f32>) -> Option<Decoded> {
 
 #[cfg(not(target_os = "macos"))]
 fn decode_portable(path: &Path, edge: u32, crop: Option<f32>) -> Option<Decoded> {
-    let edge = edge.clamp(1, 8192);
-    let mut img = image::open(path).ok()?.into_rgba8();
+    let mut img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?.into_rgba8();
     let (w, h) = (img.width(), img.height());
+    // Cache paths have no suffix, and a requested thumbnail must not enlarge a small source.
+    let edge = edge.clamp(1, 8192).min(w.max(h));
     let (nw, nh) = if w >= h {
         let nh = ((h as u64 * edge as u64) / w as u64).max(1) as u32;
         (edge, nh)
@@ -691,6 +692,18 @@ mod tests {
 
     fn fixture(name: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    #[test]
+    fn cached_images_decode_without_filename_extensions() {
+        for (ix, format) in [image::ImageFormat::Png, image::ImageFormat::Jpeg, image::ImageFormat::WebP].into_iter().enumerate() {
+            let path = std::env::temp_dir().join(format!("tc-extensionless-{}-{ix}", std::process::id()));
+            let image = image::RgbImage::from_pixel(32, 16, image::Rgb([220, 40, 60]));
+            image.save_with_format(&path, format).unwrap();
+            let decoded = decode(&path, 16, None).expect("cache files have no extension; use their bytes");
+            assert_eq!((decoded.width, decoded.height), (16, 8));
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

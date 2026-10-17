@@ -182,6 +182,9 @@ removing a file (Discord) and replacing a photo (Telegram) are P2.
   are computed from the trigger bounds before layout. Grid = `uniform_list` of rows (9 emoji / 1 justified GIF row / 4
   stickers), so ~12 rows exist; images decode in `Images` only for visible rows and drop on scroll-off; the entity and
   `media/<net>/pick/` die on close.
+- **Still-image decode**: media cache filenames have no extension. On Linux and
+  Windows, detect the image format from its bytes, as on macOS. Thumbnail decoding
+  shrinks large sources but never enlarges a smaller source to the requested edge.
 - **GIF decode rule**: every cell is a first-frame still (`images.rs` reads index 0 only). The one hovered cell swaps to
   `img()` of the provider's smallest GIF rendition (Tenor `tinygif`, ~220 px): this rev's `img()` steps frames itself
   and stops under `reduce_motion()`. Played only if width × height × 4 × frames ≤ 8 MB, else it stays still; dropped

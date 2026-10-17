@@ -178,6 +178,8 @@ Items that do not apply are disabled, never hidden; names follow the open place 
 - **Animates, only**: menu and popover in 120 / out 80 (opacity + 4 toward anchor); modal and toast in 160 / out 100
   (opacity + 8 rise); scrollbar fade 150 after 800 idle; typing dots stepped at 400. Reduce Motion: all 0. Nothing else.
 - **Tooltips**: 500 delay, appear whole, 0 delay for 1.5 s after one closes, gone on mouse-down or leave. Every
-  icon-only button has one, with its shortcut in `text_faint`.
+  icon-only button has one, with its shortcut in `text_faint`. Text wraps within
+  the 240-point tooltip; the shortcut stays on one line beside it. Long failure
+  reasons must not paint outside the tooltip background.
 - **Focus**, keyboard only: rows and menu items a 2 inset `focus` ring over any fill; controls a 2 gap then a 2 ring;
   fields a `focus` border + 3 halo while focused. The list cursor is the ring, the open conversation the fill (`07` R8).

@@ -30,8 +30,8 @@ impl Render for Tip {
             .font_family(theme::FONT)
             .type_small()
             .text_color(theme::text())
-            .child(self.words.clone())
-            .children(self.shortcut.clone().map(|keys| div().text_color(theme::text_faint()).child(keys)))
+            .child(div().flex_1().min_w_0().whitespace_normal().overflow_hidden().child(self.words.clone()))
+            .children(self.shortcut.clone().map(|keys| div().flex_none().whitespace_nowrap().text_color(theme::text_faint()).child(keys)))
     }
 }
 
