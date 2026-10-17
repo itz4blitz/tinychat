@@ -1018,6 +1018,7 @@ name = "chatd"
 version = "0.2.5"
 dependencies = [
  "aes 0.8.4",
+ "aes-gcm",
  "aes-gcm-siv",
  "async-trait",
  "base64 0.22.1",

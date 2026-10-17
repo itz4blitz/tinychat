@@ -58,6 +58,9 @@ ctr = "0.9"
 hmac = "0.12"
 sha2 = "0.10"
 cipher = "0.4"
+# Messages media is AES-256-GCM, separate from the relay's AES-CTR. chatd decrypts the bytes and
+# never the picture.
+aes-gcm = "0.10"
 # The store traits presage asks for are async-trait's, and name chrono's times and rand's
 # generator. All three are in presage's tree at these versions.
 async-trait = { version = "0.1", optional = true }

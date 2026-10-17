@@ -71,7 +71,7 @@ Current release: [v0.2.5](https://github.com/itz4blitz/tinyclient/releases/tag/v
 | **Teams** | Microsoft's sign-in page. Work and school accounts only. | Teams, channels, chats, reply chains as threads, presence. Giphy GIFs play. | Text, files through OneDrive, reactions, edit, delete, mute | Calls and meetings open in Teams |
 | **Telegram** | QR code from your phone, or a phone number and code, plus a 2FA password | Chats, folders, topics, photos, pins | Text, files, reactions, edit, delete, mute, leave | Calls open in Telegram |
 | **Signal** | Linked as a device. Scan a QR code from your phone. | Direct and group chats, replies, mentions, reactions, edits, deletes. Photos and files appear as a labelled line. Nothing from before the link. Your own chat is **Note to Self**, including messages sent from your phone. | Text, replies, reactions, edit and delete your own | Not built |
-| **Messages** | Paired from the Android phone, the way [messages.google.com](https://messages.google.com) is. The phone stays the account and has to stay online. | Texts in the chats the phone already has. Photos and files appear as a labelled line. | Text. Reactions are not in this version. | Opens in Messages |
+| **Messages** | Paired from the Android phone, the way [messages.google.com](https://messages.google.com) is. The phone stays the account and has to stay online. | Texts in the chats the phone already has. Photos are shown. Other files are named and can be opened. | Text, one file at a time, reactions. A large photo may be sent as a smaller copy. | Opens in Messages |
 
 A few behaviours that are easy to miss:
 
@@ -82,7 +82,7 @@ A few behaviours that are easy to miss:
 - **Terminal.** `tinyclient --text`, or any build without the `gui` feature, prints account status and the inbox as lines of text. An interactive terminal UI is not built. The socket protocol is enough to write one.
 - **Platforms.** CI builds and tests macOS, Linux, and Windows on every push (`.github/workflows/ci.yml`). Most development happens on macOS, so reports and fixes from Linux and Windows are especially welcome. The main window closes cleanly on all three. Linux web sign-in, including Discord's session capture, works with WebKitGTK.
 
-Still not built, and not covered by an open pull request: message search in the window, notifications and a dock badge, voice messages, Signal attachments and safety numbers, Messages reactions and shown photos, Teams personal accounts, and video or screen share (see [work in progress](#work-in-progress) for the Discord slice that is underway).
+Still not built, and not covered by an open pull request: message search in the window, notifications and a dock badge, voice messages, Signal attachments and safety numbers, Teams personal accounts, and video or screen share (see [work in progress](#work-in-progress) for the Discord slice that is underway).
 
 ## Work in progress
 

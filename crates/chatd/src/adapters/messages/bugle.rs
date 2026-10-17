@@ -20,6 +20,9 @@ const USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KH
 const ORIGIN: &str = "https://messages.google.com";
 const QR_BASE: &str = "https://support.google.com/messages/?p=web_computer#?c=";
 const RELAY: &str = "https://instantmessaging-pa.googleapis.com/$rpc/google.internal.communications.instantmessaging.v1";
+const UPLOAD: &str = "https://instantmessaging-pa.googleapis.com/upload";
+/// A guard for this client, not a limit Google publishes.
+const FILE_CAP: u64 = 100 * 1024 * 1024;
 const NETWORK: &str = "Bugle";
 /// How long one request waits for the phone to answer on the long-poll.
 const PHONE: Duration = Duration::from_secs(20);
@@ -32,7 +35,9 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn unb64(text: &str) -> Option<Vec<u8>> {
-    base64::engine::general_purpose::STANDARD.decode(text.trim()).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .ok()
 }
 
 fn random(n: usize) -> Vec<u8> {
@@ -222,18 +227,30 @@ fn fields(mut input: &[u8]) -> Vec<Field> {
         let wire = (key & 7) as u32;
         match wire {
             0 => {
-                let Some(n) = read_varint(&mut input) else { break };
-                out.push(Field { number, bytes: Vec::new(), varint: Some(n) });
+                let Some(n) = read_varint(&mut input) else {
+                    break;
+                };
+                out.push(Field {
+                    number,
+                    bytes: Vec::new(),
+                    varint: Some(n),
+                });
             }
             2 => {
-                let Some(len) = read_varint(&mut input) else { break };
+                let Some(len) = read_varint(&mut input) else {
+                    break;
+                };
                 let len = len as usize;
                 if input.len() < len {
                     break;
                 }
                 let (data, rest) = input.split_at(len);
                 input = rest;
-                out.push(Field { number, bytes: data.to_vec(), varint: None });
+                out.push(Field {
+                    number,
+                    bytes: data.to_vec(),
+                    varint: None,
+                });
             }
             1 => {
                 if input.len() < 8 {
@@ -258,15 +275,29 @@ fn field<'a>(list: &'a [Field], number: u32) -> Option<&'a Field> {
 }
 
 fn field_text(list: &[Field], number: u32) -> String {
-    field(list, number).map(|field| String::from_utf8_lossy(&field.bytes).into_owned()).unwrap_or_default()
+    field(list, number)
+        .map(|field| String::from_utf8_lossy(&field.bytes).into_owned())
+        .unwrap_or_default()
 }
 
 fn field_bytes(list: &[Field], number: u32) -> Vec<u8> {
-    field(list, number).map(|field| field.bytes.clone()).unwrap_or_default()
+    field(list, number)
+        .map(|field| field.bytes.clone())
+        .unwrap_or_default()
 }
 
 fn field_int(list: &[Field], number: u32) -> u64 {
-    field(list, number).and_then(|field| field.varint).unwrap_or(0)
+    field(list, number)
+        .and_then(|field| field.varint)
+        .unwrap_or(0)
+}
+
+fn field_texts(list: &[Field], number: u32) -> Vec<String> {
+    list.iter()
+        .filter(|field| field.number == number)
+        .map(|field| String::from_utf8_lossy(&field.bytes).into_owned())
+        .filter(|text| !text.is_empty())
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -277,7 +308,10 @@ struct Device {
 
 fn decode_device(bytes: &[u8]) -> Device {
     let list = fields(bytes);
-    Device { user: field_int(&list, 1) as i64, source: field_text(&list, 2) }
+    Device {
+        user: field_int(&list, 1) as i64,
+        source: field_text(&list, 2),
+    }
 }
 
 fn decode_token(bytes: &[u8]) -> (Vec<u8>, i64) {
@@ -300,7 +334,12 @@ fn decode_register(bytes: &[u8]) -> Option<RelayReply> {
     if pairing.is_empty() || token.is_empty() || browser.source.is_empty() {
         return None;
     }
-    Some(RelayReply { browser, pairing, token, ttl })
+    Some(RelayReply {
+        browser,
+        pairing,
+        token,
+        ttl,
+    })
 }
 
 /// What the keychain holds after a phone has paired. `key` is the ECDSA signing key, hex PKCS#8,
@@ -352,14 +391,35 @@ fn as_bytes(value: &serde_json::Value) -> Vec<u8> {
 /// PBLite: array index is field number minus one. Int64 is a string. Bytes are standard base64.
 fn pblite_auth(request: &str, token: &[u8]) -> serde_json::Value {
     let config = serde_json::json!([null, null, 2026, 9, 2, null, 4, null, 6]);
-    serde_json::json!([request, null, NETWORK, null, null, if token.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(b64(token)) }, config])
+    serde_json::json!([
+        request,
+        null,
+        NETWORK,
+        null,
+        null,
+        if token.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(b64(token))
+        },
+        config
+    ])
 }
 
 fn pblite_device(device: &Device) -> serde_json::Value {
     serde_json::json!([device.user.to_string(), device.source, NETWORK])
 }
 
-fn outgoing(mobile: &Device, request: &str, session: &str, action: u32, encrypted: &[u8], token: &[u8], ttl: i64, message_type: u32) -> serde_json::Value {
+fn outgoing(
+    mobile: &Device,
+    request: &str,
+    session: &str,
+    action: u32,
+    encrypted: &[u8],
+    token: &[u8],
+    ttl: i64,
+    message_type: u32,
+) -> serde_json::Value {
     let mut data = Buf::new();
     data.text(1, request);
     data.int(2, action as u64);
@@ -368,15 +428,40 @@ fn outgoing(mobile: &Device, request: &str, session: &str, action: u32, encrypte
     let inner = serde_json::json!([
         request,
         19,
-        null, null, null, null, null, null, null, null, null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         b64(&data.0),
-        null, null, null, null, null, null, null, null, null, null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
         [serde_json::json!([]), message_type]
     ]);
     serde_json::json!([
         pblite_device(mobile),
         inner,
-        [request, null, null, null, null, b64(token), serde_json::json!([null, null, 2026, 9, 2, null, 4, null, 6])],
+        [
+            request,
+            null,
+            null,
+            null,
+            null,
+            b64(token),
+            serde_json::json!([null, null, 2026, 9, 2, null, 4, null, 6])
+        ],
         null,
         ttl.to_string()
     ])
@@ -417,6 +502,114 @@ fn send_request(conversation: &str, text: &str, tmp: &str, mine: &str) -> Vec<u8
     req.0
 }
 
+fn refused(bytes: &[u8]) -> Result<(), String> {
+    let list = fields(bytes);
+    let status = field_int(&list, 3);
+    if status > 1 {
+        return Err("Messages didn't do that. Keep the phone online.".into());
+    }
+    if field(&list, 1).is_some_and(|field| field.varint == Some(0)) {
+        return Err("Messages didn't do that.".into());
+    }
+    Ok(())
+}
+
+fn opened(key: &[u8], bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if key.len() == 32 && bytes.first() == Some(&0) {
+        super::media::unpack(key, &bytes)
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn looks_b64(bytes: &[u8]) -> bool {
+    !bytes.is_empty()
+        && bytes.len() % 4 == 0
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+}
+
+fn mime_of(name: &str) -> &'static str {
+    match name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "pdf" => "application/pdf",
+        "vcf" => "text/vcard",
+        _ => "application/octet-stream",
+    }
+}
+
+fn send_media_request(
+    conversation: &str,
+    caption: &str,
+    tmp: &str,
+    mine: &str,
+    media_id: &str,
+    key: &[u8],
+    name: &str,
+    mime: &str,
+    size: u64,
+) -> Vec<u8> {
+    let mut media = Buf::new();
+    media.text(2, media_id);
+    media.text(4, name);
+    media.int(5, size);
+    media.bytes(11, key);
+    media.text(14, mime);
+    let mut media_info = Buf::new();
+    media_info.msg(3, &media.0);
+    let mut payload = Buf::new();
+    payload.text(1, tmp);
+    payload.text(7, conversation);
+    payload.text(9, mine);
+    payload.msg(10, &media_info.0);
+    if !caption.is_empty() {
+        let mut content = Buf::new();
+        content.text(1, caption);
+        let mut payload_content = Buf::new();
+        payload_content.msg(1, &content.0);
+        payload.msg(6, &payload_content.0);
+        let mut caption_info = Buf::new();
+        caption_info.msg(2, &content.0);
+        payload.msg(10, &caption_info.0);
+    }
+    payload.text(12, tmp);
+    let mut req = Buf::new();
+    req.text(2, conversation);
+    req.msg(3, &payload.0);
+    req.text(5, tmp);
+    req.0
+}
+
+fn reaction_request(message: &str, emoji: &str, action: u64) -> Vec<u8> {
+    let mut data = Buf::new();
+    data.text(1, emoji);
+    data.int(2, reaction_type(emoji));
+    let mut req = Buf::new();
+    req.text(1, message);
+    req.msg(2, &data.0);
+    req.int(3, action);
+    req.0
+}
+
+fn image_request(message: &str, action: &str) -> Vec<u8> {
+    let mut req = Buf::new();
+    req.text(1, message);
+    req.text(2, action);
+    req.0
+}
+
 fn read_request(conversation: &str, message: &str) -> Vec<u8> {
     let mut buf = Buf::new();
     buf.text(2, conversation);
@@ -453,7 +646,29 @@ pub struct Chat {
     pub mine: String,
 }
 
-#[derive(Clone)]
+/// One photo or file on a message. Bytes are already opened when the phone sent them inline.
+#[derive(Clone, Default)]
+pub struct Piece {
+    pub name: String,
+    pub mime: String,
+    pub media_id: String,
+    pub key: Vec<u8>,
+    /// The message part this file belongs to, for a later full-size fetch.
+    pub action_id: String,
+    pub inline: Vec<u8>,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One emoji on a message, and who put it there.
+#[derive(Clone, Default)]
+pub struct Mark {
+    pub emoji: String,
+    pub who: Vec<String>,
+}
+
+#[derive(Clone, Default)]
 pub struct Note {
     pub id: String,
     pub conversation: String,
@@ -463,6 +678,8 @@ pub struct Note {
     pub text: String,
     pub outgoing: bool,
     pub file: bool,
+    pub pieces: Vec<Piece>,
+    pub reactions: Vec<Mark>,
 }
 
 struct Live {
@@ -484,17 +701,31 @@ struct Waiter {
 }
 
 /// Speaks to Google until the phone scans the code, then returns the session.
-pub fn pair(show: &dyn Fn(String), cancel: &std::sync::atomic::AtomicBool) -> Result<Saved, String> {
-    let signing = SigningKey::from_slice(&random(32)).map_err(|_| "could not make a pairing key".to_owned())?;
-    let public = signing.verifying_key().to_public_key_der().map_err(|_| "could not encode the pairing key".to_owned())?;
+pub fn pair(
+    show: &dyn Fn(String),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Saved, String> {
+    let signing = SigningKey::from_slice(&random(32))
+        .map_err(|_| "could not make a pairing key".to_owned())?;
+    let public = signing
+        .verifying_key()
+        .to_public_key_der()
+        .map_err(|_| "could not encode the pairing key".to_owned())?;
     let aes_key = random(32);
     let hmac_key = random(32);
     let agent = agent(Duration::from_secs(30));
     let mut cookies = String::new();
     let body = register_body(public.as_bytes());
-    let response = post(&agent, &format!("{RELAY}.Pairing/RegisterPhoneRelay"), "application/x-protobuf", &body, &cookies)?;
+    let response = post(
+        &agent,
+        &format!("{RELAY}.Pairing/RegisterPhoneRelay"),
+        "application/x-protobuf",
+        &body,
+        &cookies,
+    )?;
     cookies = merge_cookies(&cookies, &response.cookies);
-    let registered = decode_register(&response.body).ok_or_else(|| "Messages did not start a pairing.".to_owned())?;
+    let registered = decode_register(&response.body)
+        .ok_or_else(|| "Messages did not start a pairing.".to_owned())?;
     let qr = url_data(&registered.pairing, &aes_key, &hmac_key);
     show(qr);
     let (events, inbox) = channel();
@@ -527,7 +758,16 @@ pub fn pair(show: &dyn Fn(String), cancel: &std::sync::atomic::AtomicBool) -> Re
     let (paired_tx, paired_rx) = channel::<Saved>();
     std::thread::Builder::new()
         .name("messages-pair".into())
-        .spawn(move || poll(poll_live, events, Arc::default(), poll_stop, false, Some(paired_tx)))
+        .spawn(move || {
+            poll(
+                poll_live,
+                events,
+                Arc::default(),
+                poll_stop,
+                false,
+                Some(paired_tx),
+            )
+        })
         .map_err(|err| err.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
@@ -559,7 +799,11 @@ fn agent(timeout: Duration) -> ureq::Agent {
     // The same system TLS as the rest of chatd. ureq's default is rustls, which this crate does
     // not enable, and asking for it panics before a pairing code exists.
     ureq::Agent::config_builder()
-        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build())
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .user_agent(USER_AGENT)
@@ -572,7 +816,13 @@ struct Http {
     cookies: String,
 }
 
-fn post(agent: &ureq::Agent, url: &str, content: &str, body: &[u8], cookies: &str) -> Result<Http, String> {
+fn post(
+    agent: &ureq::Agent,
+    url: &str,
+    content: &str,
+    body: &[u8],
+    cookies: &str,
+) -> Result<Http, String> {
     let mut request = agent
         .post(url)
         .header("Content-Type", content)
@@ -580,11 +830,16 @@ fn post(agent: &ureq::Agent, url: &str, content: &str, body: &[u8], cookies: &st
         .header("x-user-agent", "grpc-web-javascript/0.1")
         .header("Origin", ORIGIN)
         .header("Referer", &format!("{ORIGIN}/"))
-        .header("sec-ch-ua", "\"Google Chrome\";v=\"152\", \"Chromium\";v=\"152\", \"Not-A.Brand\";v=\"24\"");
+        .header(
+            "sec-ch-ua",
+            "\"Google Chrome\";v=\"152\", \"Chromium\";v=\"152\", \"Not-A.Brand\";v=\"24\"",
+        );
     if !cookies.is_empty() {
         request = request.header("Cookie", cookies);
     }
-    let mut response = request.send(body).map_err(|err| format!("Messages: {err}"))?;
+    let mut response = request
+        .send(body)
+        .map_err(|err| format!("Messages: {err}"))?;
     let status = response.status().as_u16();
     let mut cookies_out = String::new();
     for (name, value) in response.headers() {
@@ -598,11 +853,18 @@ fn post(agent: &ureq::Agent, url: &str, content: &str, body: &[u8], cookies: &st
         }
     }
     let mut body = Vec::new();
-    response.body_mut().as_reader().read_to_end(&mut body).map_err(|err| err.to_string())?;
+    response
+        .body_mut()
+        .as_reader()
+        .read_to_end(&mut body)
+        .map_err(|err| err.to_string())?;
     if !(200..300).contains(&status) {
         return Err(format!("Messages refused the request ({status})."));
     }
-    Ok(Http { body, cookies: cookies_out })
+    Ok(Http {
+        body,
+        cookies: cookies_out,
+    })
 }
 
 fn merge_cookies(old: &str, new: &str) -> String {
@@ -626,7 +888,9 @@ pub struct Session {
 
 impl Session {
     pub fn open(saved: Saved) -> Result<Session, String> {
-        let (aes, hmac, token) = saved.keys().ok_or_else(|| "the Messages session is unreadable".to_owned())?;
+        let (aes, hmac, token) = saved
+            .keys()
+            .ok_or_else(|| "the Messages session is unreadable".to_owned())?;
         let (events, heard) = channel();
         let live = Arc::new(Mutex::new(Live {
             ttl: saved.ttl,
@@ -645,13 +909,25 @@ impl Session {
             waiters: Arc::default(),
             stop: Arc::default(),
         };
-        let (live, events, waiters, stop) = (session.live.clone(), session.events.clone(), session.waiters.clone(), session.stop.clone());
+        let (live, events, waiters, stop) = (
+            session.live.clone(),
+            session.events.clone(),
+            session.waiters.clone(),
+            session.stop.clone(),
+        );
         std::thread::Builder::new()
             .name("messages-events".into())
             .spawn(move || {
                 let mut first = true;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    poll(live.clone(), events.clone(), waiters.clone(), stop.clone(), first, None);
+                    poll(
+                        live.clone(),
+                        events.clone(),
+                        waiters.clone(),
+                        stop.clone(),
+                        first,
+                        None,
+                    );
                     first = false;
                     if stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
@@ -664,12 +940,22 @@ impl Session {
     }
 
     pub fn events(&self) -> Option<Receiver<crate::adapters::messages::Event>> {
-        self.heard.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+        self.heard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     pub fn me(&self) -> (String, String) {
-        let live = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let name = if live.saved.name.is_empty() { "Messages".into() } else { live.saved.name.clone() };
+        let live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let name = if live.saved.name.is_empty() {
+            "Messages".into()
+        } else {
+            live.saved.name.clone()
+        };
         (live.saved.account.clone(), name)
     }
 
@@ -684,32 +970,85 @@ impl Session {
     /// SetActiveSession. The request id is the long-poll's session id; without it the phone
     /// accepts the pair and then sends nothing.
     fn activate(&self) -> Result<(), String> {
-        let session = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).session.clone();
+        let session = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .session
+            .clone();
         let _ = self.rpc_as(&session, 16, &[], 2)?;
         Ok(())
     }
 
-    fn rpc_as(&self, request: &str, action: u32, plain: &[u8], message_type: u32) -> Result<Vec<u8>, String> {
+    fn rpc_as(
+        &self,
+        request: &str,
+        action: u32,
+        plain: &[u8],
+        message_type: u32,
+    ) -> Result<Vec<u8>, String> {
         let request = request.to_owned();
         let (session, body, cookies) = {
-            let live = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let encrypted = if plain.is_empty() { Vec::new() } else { seal(&live.aes, &live.hmac, plain) };
-            let mobile = Device { user: live.saved.mobile_user, source: live.saved.mobile.clone() };
-            let body = outgoing(&mobile, &request, &live.session, action, &encrypted, &live.token, live.ttl, message_type);
-            (live.session.clone(), serde_json::to_vec(&body).unwrap_or_default(), live.cookies.clone())
+            let live = self
+                .live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let encrypted = if plain.is_empty() {
+                Vec::new()
+            } else {
+                seal(&live.aes, &live.hmac, plain)
+            };
+            let mobile = Device {
+                user: live.saved.mobile_user,
+                source: live.saved.mobile.clone(),
+            };
+            let body = outgoing(
+                &mobile,
+                &request,
+                &live.session,
+                action,
+                &encrypted,
+                &live.token,
+                live.ttl,
+                message_type,
+            );
+            (
+                live.session.clone(),
+                serde_json::to_vec(&body).unwrap_or_default(),
+                live.cookies.clone(),
+            )
         };
         let (tx, rx) = channel();
-        self.waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(Waiter { request: request.clone(), session: session.clone(), reply: tx });
+        self.waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Waiter {
+                request: request.clone(),
+                session: session.clone(),
+                reply: tx,
+            });
         let agent = agent(Duration::from_secs(30));
-        let sent = post(&agent, &format!("{RELAY}.Messaging/SendMessage"), "application/json+protobuf", &body, &cookies);
+        let sent = post(
+            &agent,
+            &format!("{RELAY}.Messaging/SendMessage"),
+            "application/json+protobuf",
+            &body,
+            &cookies,
+        );
         if let Err(err) = sent {
-            self.waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|waiter| waiter.request != request);
+            self.waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|waiter| waiter.request != request);
             return Err(err);
         }
         match rx.recv_timeout(PHONE) {
             Ok(bytes) => Ok(bytes),
             Err(_) => {
-                self.waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|waiter| waiter.request != request);
+                self.waiters
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|waiter| waiter.request != request);
                 Err("Your phone isn't responding. Keep Messages open, and the phone online.".into())
             }
         }
@@ -727,19 +1066,231 @@ impl Session {
         Ok(decode_messages(&bytes))
     }
 
+    fn mine_of(&self, conversation: &str) -> String {
+        let live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        live.chats
+            .iter()
+            .find(|chat| chat.id == conversation)
+            .map(|chat| chat.mine.clone())
+            .unwrap_or_default()
+    }
+
     pub fn send(&self, conversation: &str, text: &str) -> Result<String, String> {
-        let mine = {
-            let live = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            live.chats.iter().find(|chat| chat.id == conversation).map(|chat| chat.mine.clone()).unwrap_or_default()
-        };
+        let mine = self.mine_of(conversation);
         let tmp = uuid();
         let bytes = self.rpc(3, &send_request(conversation, text, &tmp, &mine), 2)?;
-        let list = fields(&bytes);
-        let status = field_int(&list, 3);
-        if status > 1 {
-            return Err("Messages didn't send that.".into());
-        }
+        refused(&bytes)?;
         Ok(tmp)
+    }
+
+    /// Encrypts the file, uploads it, and asks the phone to send it. A large photo may leave as
+    /// an MMS copy; this does not promise an RCS high-quality send.
+    pub fn send_file(
+        &self,
+        conversation: &str,
+        caption: &str,
+        path: &str,
+        name: &str,
+    ) -> Result<String, String> {
+        let named = if name.is_empty() { "file" } else { name };
+        let meta =
+            std::fs::metadata(path).map_err(|_| format!("Messages couldn't read {named}."))?;
+        if meta.len() > FILE_CAP {
+            return Err(
+                "That file is larger than 100 MB, which tinyclient won't send through Messages."
+                    .into(),
+            );
+        }
+        let plain = std::fs::read(path).map_err(|_| format!("Messages couldn't read {named}."))?;
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
+        let packed = super::media::pack(&key, &plain)?;
+        let mime = mime_of(named);
+        let media_id = self.upload(&packed, &mime)?;
+        let mine = self.mine_of(conversation);
+        let tmp = uuid();
+        let bytes = self.rpc(
+            3,
+            &send_media_request(
+                conversation,
+                caption,
+                &tmp,
+                &mine,
+                &media_id,
+                &key,
+                named,
+                &mime,
+                plain.len() as u64,
+            ),
+            2,
+        )?;
+        refused(&bytes)?;
+        Ok(tmp)
+    }
+
+    pub fn react(&self, message: &str, emoji: &str, on: bool) -> Result<(), String> {
+        let action = if on { 1 } else { 2 };
+        let bytes = self.rpc(38, &reaction_request(message, emoji, action), 2)?;
+        if on && refused(&bytes).is_err() {
+            let switched = self.rpc(38, &reaction_request(message, emoji, 3), 2)?;
+            refused(&switched)?;
+            return Ok(());
+        }
+        refused(&bytes)
+    }
+
+    /// The bytes of one attachment, opened. The content store is asked first; the phone is asked
+    /// for the full image when that has nothing.
+    pub fn fetch(
+        &self,
+        media_id: &str,
+        key: &[u8],
+        message: &str,
+        action: &str,
+    ) -> Result<Vec<u8>, String> {
+        if !media_id.is_empty() {
+            if let Ok(bytes) = self.download(media_id) {
+                return opened(key, bytes);
+            }
+        }
+        if !message.is_empty() {
+            let asked = self
+                .rpc(36, &image_request(message, action), 2)
+                .unwrap_or_default();
+            if let Some(inline) = decode_messages(&asked)
+                .into_iter()
+                .flat_map(|note| note.pieces)
+                .find(|piece| !piece.inline.is_empty())
+            {
+                return Ok(inline.inline);
+            }
+        }
+        Err("Messages couldn't fetch that file. Keep the phone online.".into())
+    }
+
+    fn upload(&self, packed: &[u8], mime: &str) -> Result<String, String> {
+        let (payload, cookies) = {
+            let live = self
+                .live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut device = Buf::new();
+            device.int(1, live.saved.mobile_user as u64);
+            device.text(2, &live.saved.mobile);
+            device.text(3, NETWORK);
+            let mut req = Buf::new();
+            req.int(1, 1);
+            req.msg(2, &auth_message(&uuid(), &live.token));
+            req.msg(3, &device.0);
+            (b64(&req.0), live.cookies.clone())
+        };
+        let http = agent(Duration::from_secs(60));
+        let mut start = http
+            .post(UPLOAD)
+            .header("Content-Type", "text/plain")
+            .header("x-goog-api-key", API_KEY)
+            .header("Origin", ORIGIN)
+            .header("X-Goog-Upload-Protocol", "resumable")
+            .header("X-Goog-Upload-Command", "start")
+            .header(
+                "X-Goog-Upload-Header-Content-Length",
+                &packed.len().to_string(),
+            )
+            .header("X-Goog-Upload-Header-Content-Type", mime);
+        if !cookies.is_empty() {
+            start = start.header("Cookie", &cookies);
+        }
+        let response = start
+            .send(payload.as_bytes())
+            .map_err(|err| format!("Messages couldn't upload that file ({err})."))?;
+        if !(200..300).contains(&response.status().as_u16()) {
+            return Err("Messages couldn't start the upload. Keep the phone online.".into());
+        }
+        let url = response
+            .headers()
+            .get("x-goog-upload-url")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        if url.is_empty() {
+            return Err("Messages didn't give an upload address.".into());
+        }
+        let mut finish = http
+            .post(&url)
+            .header("Content-Type", mime)
+            .header("X-Goog-Upload-Command", "upload, finalize")
+            .header("X-Goog-Upload-Offset", "0");
+        if !cookies.is_empty() {
+            finish = finish.header("Cookie", &cookies);
+        }
+        let mut response = finish
+            .send(packed)
+            .map_err(|err| format!("Messages couldn't upload that file ({err})."))?;
+        let status = response.status().as_u16();
+        let mut body = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .read_to_end(&mut body)
+            .map_err(|err| err.to_string())?;
+        if !(200..300).contains(&status) {
+            return Err("Messages refused the upload.".into());
+        }
+        let raw = if looks_b64(&body) {
+            unb64(&String::from_utf8_lossy(&body)).unwrap_or(body)
+        } else {
+            body
+        };
+        let list = fields(&raw);
+        let media = field_text(&fields(&field_bytes(&list, 1)), 1);
+        if media.is_empty() {
+            return Err("Messages uploaded the file and sent back no id.".into());
+        }
+        Ok(media)
+    }
+
+    fn download(&self, media_id: &str) -> Result<Vec<u8>, String> {
+        let (payload, cookies) = {
+            let live = self
+                .live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut info = Buf::new();
+            info.text(1, media_id);
+            info.int(2, 1);
+            let mut req = Buf::new();
+            req.msg(1, &info.0);
+            req.msg(2, &auth_message(&uuid(), &live.token));
+            (b64(&req.0), live.cookies.clone())
+        };
+        let http = agent(Duration::from_secs(60));
+        let mut request = http
+            .get(UPLOAD)
+            .header("x-goog-api-key", API_KEY)
+            .header("Origin", ORIGIN)
+            .header("X-Goog-Download-Metadata", &payload);
+        if !cookies.is_empty() {
+            request = request.header("Cookie", &cookies);
+        }
+        let mut response = request
+            .call()
+            .map_err(|err| format!("Messages couldn't fetch that file ({err})."))?;
+        if !(200..300).contains(&response.status().as_u16()) {
+            return Err("Messages couldn't fetch that file.".into());
+        }
+        let mut body = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .read_to_end(&mut body)
+            .map_err(|err| err.to_string())?;
+        if body.is_empty() {
+            return Err("Messages returned an empty file.".into());
+        }
+        Ok(body)
     }
 
     pub fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
@@ -757,19 +1308,36 @@ impl Session {
         if chats.is_empty() {
             return;
         }
-        self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).chats = chats.clone();
-        let _ = self.events.send(crate::adapters::messages::Event::Chats(chats));
+        self.live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .chats = chats.clone();
+        let _ = self
+            .events
+            .send(crate::adapters::messages::Event::Chats(chats));
     }
 }
 
-fn poll(live: Arc<Mutex<Live>>, events: Sender<crate::adapters::messages::Event>, waiters: Arc<Mutex<Vec<Waiter>>>, stop: Arc<std::sync::atomic::AtomicBool>, announce: bool, paired: Option<Sender<Saved>>) {
+fn poll(
+    live: Arc<Mutex<Live>>,
+    events: Sender<crate::adapters::messages::Event>,
+    waiters: Arc<Mutex<Vec<Waiter>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    announce: bool,
+    paired: Option<Sender<Saved>>,
+) {
     let agent = agent(Duration::from_secs(90));
     let (request, token, cookies) = {
         let held = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (uuid(), held.token.clone(), held.cookies.clone())
     };
     // field 4 is an empty wrapper the web client sends: [null, []].
-    let payload = serde_json::json!([pblite_auth(&request, &token), null, null, [null, serde_json::json!([])]]);
+    let payload = serde_json::json!([
+        pblite_auth(&request, &token),
+        null,
+        null,
+        [null, serde_json::json!([])]
+    ]);
     let body = serde_json::to_vec(&payload).unwrap_or_default();
     let mut request = agent
         .post(&format!("{RELAY}.Messaging/ReceiveMessages"))
@@ -782,11 +1350,15 @@ fn poll(live: Arc<Mutex<Live>>, events: Sender<crate::adapters::messages::Event>
         request = request.header("Cookie", &cookies);
     }
     let Ok(mut response) = request.send(&body) else {
-        let _ = events.send(crate::adapters::messages::Event::Closed("Couldn't reach Messages.".into()));
+        let _ = events.send(crate::adapters::messages::Event::Closed(
+            "Couldn't reach Messages.".into(),
+        ));
         return;
     };
     if !(200..300).contains(&response.status().as_u16()) {
-        let _ = events.send(crate::adapters::messages::Event::Closed("Messages refused the connection.".into()));
+        let _ = events.send(crate::adapters::messages::Event::Closed(
+            "Messages refused the connection.".into(),
+        ));
         return;
     }
     // The long-poll is open. Commands (SetActiveSession, then the inbox) go out on another
@@ -844,10 +1416,20 @@ fn take_complete(bytes: &[u8]) -> usize {
             _ => {}
         }
     }
-    if depth == 0 { end } else { start.unwrap_or(0) }
+    if depth == 0 {
+        end
+    } else {
+        start.unwrap_or(0)
+    }
 }
 
-fn consume(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters::messages::Event>, waiters: &Mutex<Vec<Waiter>>, paired: &Option<Sender<Saved>>) {
+fn consume(
+    bytes: &[u8],
+    live: &Mutex<Live>,
+    events: &Sender<crate::adapters::messages::Event>,
+    waiters: &Mutex<Vec<Waiter>>,
+    paired: &Option<Sender<Saved>>,
+) {
     let text = String::from_utf8_lossy(bytes);
     let mut depth = 0i32;
     let mut start = None;
@@ -890,7 +1472,13 @@ fn consume(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters::me
     }
 }
 
-fn on_payload(value: &serde_json::Value, live: &Mutex<Live>, events: &Sender<crate::adapters::messages::Event>, waiters: &Mutex<Vec<Waiter>>, paired: &Option<Sender<Saved>>) {
+fn on_payload(
+    value: &serde_json::Value,
+    live: &Mutex<Live>,
+    events: &Sender<crate::adapters::messages::Event>,
+    waiters: &Mutex<Vec<Waiter>>,
+    paired: &Option<Sender<Saved>>,
+) {
     // Long-poll chunks are one payload, or a stream wrapped in an extra array.
     if let Some(list) = value.as_array() {
         if list.first().and_then(|item| item.as_array()).is_some() && at(value, 2).is_none() {
@@ -923,8 +1511,13 @@ fn on_payload(value: &serde_json::Value, live: &Mutex<Live>, events: &Sender<cra
         open_seal(&held.aes, &held.hmac, &encrypted).unwrap_or_default()
     };
     if !echoed.is_empty() && !plain.is_empty() {
-        let mut waiting = waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(at) = waiting.iter().position(|waiter| waiter.request == echoed || waiter.session == echoed) {
+        let mut waiting = waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(at) = waiting
+            .iter()
+            .position(|waiter| waiter.request == echoed || waiter.session == echoed)
+        {
             let waiter = waiting.remove(at);
             drop(waiting);
             let _ = waiter.reply.send(plain.clone());
@@ -937,7 +1530,9 @@ fn on_payload(value: &serde_json::Value, live: &Mutex<Live>, events: &Sender<cra
         1 => {
             let chats = decode_chats(&plain);
             if !chats.is_empty() {
-                live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).chats = chats.clone();
+                live.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .chats = chats.clone();
                 let _ = events.send(crate::adapters::messages::Event::Chats(chats));
             }
         }
@@ -986,7 +1581,9 @@ fn on_updates(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters:
     if let Some(conversations) = field(&list, 2) {
         let chats = decode_chats(&conversations.bytes);
         if !chats.is_empty() {
-            live.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).chats = chats.clone();
+            live.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .chats = chats.clone();
             let _ = events.send(crate::adapters::messages::Event::Chats(chats));
         }
     }
@@ -1002,7 +1599,12 @@ fn on_updates(bytes: &[u8], live: &Mutex<Live>, events: &Sender<crate::adapters:
         let who = field_text(&user, 2);
         let started = field_int(&data, 3) == 1;
         if !conversation.is_empty() {
-            let _ = events.send(crate::adapters::messages::Event::Typing { conversation, by: who.clone(), name: who, started });
+            let _ = events.send(crate::adapters::messages::Event::Typing {
+                conversation,
+                by: who.clone(),
+                name: who,
+                started,
+            });
         }
     }
 }
@@ -1030,7 +1632,11 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             let pid = field_text(&info, 3);
             let name = {
                 let full = field_text(&participant, 3);
-                if full.is_empty() { field_text(&participant, 2) } else { full }
+                if full.is_empty() {
+                    field_text(&participant, 2)
+                } else {
+                    full
+                }
             };
             let is_me = field_int(&participant, 6) != 0;
             if is_me && !pid.is_empty() {
@@ -1045,17 +1651,134 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             }
         }
         if title.is_empty() {
-            title = if group { "Group".into() } else { "Messages".into() };
+            title = if group {
+                "Group".into()
+            } else {
+                "Messages".into()
+            };
         }
-        chats.push(Chat { id, title, group, unread, mine });
+        chats.push(Chat {
+            id,
+            title,
+            group,
+            unread,
+            mine,
+        });
     }
     chats
+}
+
+fn emoji_of(unicode: &str, kind: u64) -> String {
+    if !unicode.is_empty() {
+        return unicode.to_owned();
+    }
+    match kind {
+        1 => "👍",
+        2 | 12 => "❤️",
+        3 => "😂",
+        4 => "😮",
+        5 => "😢",
+        6 | 11 => "😡",
+        7 => "👎",
+        9 => "🤔",
+        10 => "😭",
+        _ => "",
+    }
+    .to_owned()
+}
+
+fn reaction_type(emoji: &str) -> u64 {
+    match emoji {
+        "👍" => 1,
+        "❤️" | "❤" => 2,
+        "😂" => 3,
+        "😮" => 4,
+        "😢" => 5,
+        "😡" => 6,
+        "👎" => 7,
+        "🤔" => 9,
+        "😭" => 10,
+        _ => 8,
+    }
+}
+
+fn decode_piece(bytes: &[u8], action_id: &str) -> Option<Piece> {
+    let media = fields(bytes);
+    let mime = field_text(&media, 14);
+    let mut name = field_text(&media, 4);
+    if name.is_empty() {
+        name = label_of(&mime).to_owned();
+    }
+    let size = field_int(&media, 5);
+    let dims = fields(&field_bytes(&media, 6));
+    let mut inline = field_bytes(&media, 7);
+    let key = field_bytes(&media, 11);
+    if !inline.is_empty() && key.len() == 32 && inline.first() == Some(&0) {
+        if let Ok(opened) = super::media::unpack(&key, &inline) {
+            inline = opened;
+        }
+    }
+    let media_id = field_text(&media, 2);
+    if name.is_empty() && media_id.is_empty() && inline.is_empty() {
+        return None;
+    }
+    Some(Piece {
+        name,
+        mime,
+        media_id,
+        key,
+        action_id: action_id.to_owned(),
+        size: if size == 0 { inline.len() as u64 } else { size },
+        width: field_int(&dims, 1) as u32,
+        height: field_int(&dims, 2) as u32,
+        inline,
+    })
+}
+
+fn label_of(mime: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "Photo"
+    } else if mime.starts_with("video/") {
+        "Video"
+    } else if mime.starts_with("audio/") {
+        "Audio"
+    } else if mime.contains("vcard") {
+        "Contact"
+    } else {
+        "File"
+    }
+}
+
+fn decode_reactions(msg: &[Field]) -> Vec<Mark> {
+    let mut marks: Vec<Mark> = Vec::new();
+    for entry in msg.iter().filter(|field| field.number == 19) {
+        let parts = fields(&entry.bytes);
+        let data = fields(&field_bytes(&parts, 1));
+        let emoji = emoji_of(&field_text(&data, 1), field_int(&data, 2));
+        if emoji.is_empty() {
+            continue;
+        }
+        let who = field_texts(&parts, 2);
+        if let Some(have) = marks.iter_mut().find(|mark| mark.emoji == emoji) {
+            for id in who {
+                if !have.who.contains(&id) {
+                    have.who.push(id);
+                }
+            }
+        } else {
+            marks.push(Mark { emoji, who });
+        }
+    }
+    marks
 }
 
 fn decode_messages(bytes: &[u8]) -> Vec<Note> {
     let list = fields(bytes);
     let mut notes = Vec::new();
-    for item in list.iter().filter(|field| field.number == 2 || field.number == 1) {
+    for item in list
+        .iter()
+        .filter(|field| field.number == 2 || field.number == 1)
+    {
         let msg = fields(&item.bytes);
         let id = field_text(&msg, 1);
         let conversation = field_text(&msg, 7);
@@ -1063,6 +1786,11 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             if field(&msg, 2).is_some() {
                 notes.extend(decode_messages(&item.bytes));
             }
+            continue;
+        }
+        let status = field_int(&fields(&field_bytes(&msg, 4)), 2);
+        // 200–299 is a tombstone, 300 a delete. Neither is a message to show.
+        if (200..300).contains(&status) || status == 300 {
             continue;
         }
         let sent = unix_seconds(field_int(&msg, 5) as i64);
@@ -1086,8 +1814,10 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
         }
         let mut text = String::new();
         let mut file = false;
+        let mut pieces = Vec::new();
         for info in msg.iter().filter(|field| field.number == 10) {
             let parts = fields(&info.bytes);
+            let action_id = field_text(&parts, 1);
             if let Some(content) = field(&parts, 2) {
                 let words = field_text(&fields(&content.bytes), 1);
                 if !words.is_empty() {
@@ -1097,15 +1827,102 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
                     text.push_str(&words);
                 }
             }
-            if field(&parts, 3).is_some() {
+            if let Some(media) = field(&parts, 3) {
                 file = true;
+                if let Some(piece) = decode_piece(&media.bytes, &action_id) {
+                    pieces.push(piece);
+                }
+            }
+            if field(&parts, 5).is_some() && pieces.is_empty() {
+                file = true;
+                pieces.push(Piece {
+                    name: "Location".into(),
+                    mime: "text/plain".into(),
+                    ..Piece::default()
+                });
             }
         }
-        if text.is_empty() && file {
-            text = "File".into();
+        let reactions = decode_reactions(&msg);
+        if text.is_empty()
+            && file
+            && pieces
+                .iter()
+                .all(|piece| piece.inline.is_empty() && piece.media_id.is_empty())
+        {
+            text = pieces
+                .iter()
+                .map(|piece| piece.name.as_str())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if text.is_empty() {
+                text = "File".into();
+            }
         }
-        notes.push(Note { id, conversation, author, name, sent, text, outgoing, file });
+        notes.push(Note {
+            id,
+            conversation,
+            author,
+            name,
+            sent,
+            text,
+            outgoing,
+            file,
+            pieces,
+            reactions,
+        });
     }
     notes
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_picture_a_caption_and_a_reaction_decode_and_a_tombstone_does_not() {
+        let mut media = Buf::new();
+        media.text(2, "media-1");
+        media.text(4, "IMG_1.jpg");
+        media.text(14, "image/jpeg");
+        media.int(5, 12);
+        media.bytes(11, &[9; 32]);
+        let mut info = Buf::new();
+        info.text(1, "part-1");
+        info.msg(3, &media.0);
+        let mut words = Buf::new();
+        words.text(1, "look");
+        let mut caption = Buf::new();
+        caption.msg(2, &words.0);
+        let mut data = Buf::new();
+        data.int(2, 1);
+        let mut entry = Buf::new();
+        entry.msg(1, &data.0);
+        entry.text(2, "phone-grace");
+        let mut message = Buf::new();
+        message.text(1, "m1");
+        message.int(5, 1_791_892_800_000_000);
+        message.text(7, "c1");
+        message.text(9, "phone-grace");
+        message.msg(10, &info.0);
+        message.msg(10, &caption.0);
+        message.msg(19, &entry.0);
+        let mut gone = Buf::new();
+        gone.text(1, "m-gone");
+        gone.text(7, "c1");
+        let mut status = Buf::new();
+        status.int(2, 200);
+        gone.msg(4, &status.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &message.0);
+        wrap.msg(1, &gone.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].text, "look");
+        assert_eq!(notes[0].pieces[0].name, "IMG_1.jpg");
+        assert_eq!(notes[0].pieces[0].media_id, "media-1");
+        assert_eq!(notes[0].pieces[0].action_id, "part-1");
+        assert_eq!(notes[0].reactions[0].emoji, "👍");
+        assert_eq!(notes[0].reactions[0].who, ["phone-grace"]);
+    }
+}
